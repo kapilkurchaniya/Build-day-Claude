@@ -1,0 +1,2837 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Bhoj · a living Upper Lake</title>
+<!--
+  BHOJ — a living simulation of Bhopal's Upper Lake (Bhojtal).
+  One self-contained file: no libraries, no network, no images.
+
+  HOW THE FILE IS ORGANISED
+    <style>            layout and theme (responsive: side panel moves below the map under 900px)
+    script "sim"       the simulation core. It never touches the DOM, so the
+                       same code runs in the browser and in node (test/harness.js).
+        1. constants and time scale          7. events, diary, Fix It actions
+        2. seeded random numbers (mulberry32) 8. Lake Health Score
+        3. world generation                   9. history for the live graphs
+        4. simulation state, PAR (all tunables) 10. plain-language explanations
+        5. step(): one fixed 6-sim-minute tick  11. Rewind snapshots
+        6. clock and sun helpers              12. scenarios (scripted stories)
+    script "ui"        everything visual: canvas rendering, main loop, controls,
+                       Explain panel, graphs, Rewind, Self-test
+
+  THE CAUSAL CHAIN, AND WHERE EACH LINK LIVES (all in script "sim")
+    sewage / rain / immersion  triggerEvent() -> processEvents() -> addNutrient()   nutrients enter, tagged by origin
+    water moves them           updateFlow() -> transportAll() -> transportField()   wind + river currents, flux-form upwind
+    nutrients feed algae       react(): grow = muMax x Monod(N) x light x temperature
+    algae make / burn oxygen   react(): photosynthesis by day, respiration always -> oxygen falls at night
+    algae die and rot          react(): death -> detritus D -> decay uses oxygen; sinks to sediment; sediment releases
+                               nutrients again when the water above has no oxygen (a bloom can feed itself)
+    low oxygen kills fish      updateFish(): stress builds below 3 mg/L -> killFish() -> carcass becomes detritus
+    consequences are logged    detect(): bloom, oxygen crash, fish kill, recovery, each linked to its causes
+    "why is it like this?"     tagShares() + causesFor() + explainCell() / explainFish()
+    fixes                      buildAction(): aerator (aer field), plant (pipe.treated), wetland (runoff filter), crew, ban
+    the headline number        healthScore();  every sim-hour recordHistory(); every 3 sim-hours takeSnapshot()
+    nutrient bookkeeping       sim.ledger + ledgerError(): sources minus sinks must equal what the lake holds
+-->
+<style>
+  :root {
+    --bg: #0e1c26; --panel: #152a36; --panel2: #1c3644; --line: #2b4a5a;
+    --text: #eaf3f4; --dim: #9db7c0; --accent: #f2b84b; --good: #6fd08c;
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; background: var(--bg); color: var(--text);
+    font-family: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; }
+  body { height: 100vh; display: grid; grid-template-rows: auto minmax(0, 1fr); }
+  header { display: flex; align-items: baseline; gap: 14px; flex-wrap: wrap;
+    padding: 10px 18px; border-bottom: 1px solid var(--line); }
+  header h1 { margin: 0; font-size: 26px; letter-spacing: 0.5px; }
+  header .sub { color: var(--dim); font-size: 15px; }
+  header #selfTestBtn { margin-left: auto; min-height: 44px; }
+  main { display: grid; grid-template-columns: minmax(0, 1fr) 400px; min-height: 0; }
+  #mapWrap { position: relative; min-width: 0; min-height: 0; padding: 12px; gap: 8px;
+    display: flex; flex-direction: column; align-items: center; justify-content: center; overflow: hidden; }
+  #toolbar { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; justify-content: space-between; }
+  #layers { display: flex; gap: 6px; flex-wrap: wrap; }
+  #toolbar button { min-height: 44px; font-size: 15px; padding: 6px 12px; }
+  #toolbar .right { display: flex; gap: 8px; align-items: center; }
+  #budgetChip { background: var(--panel2); border: 1px solid var(--line); border-radius: 10px; padding: 9px 14px;
+    font-weight: 700; font-size: 16px; font-variant-numeric: tabular-nums; white-space: nowrap; }
+  #strip { display: flex; flex-direction: column; gap: 6px; min-height: 124px; }
+  #toast { color: var(--accent); min-height: 1.4em; font-size: 16px; font-weight: 600; }
+  #caption { font-size: 20px; line-height: 1.3; min-height: 2.6em; font-weight: 600; }
+  #legend { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; font-size: 14px; color: var(--dim); }
+  #legend .lt { color: var(--text); font-weight: 600; }
+  #legend .bw { width: min(260px, 100%); flex: none; padding: 0 10px; }
+  #legend .bar { height: 14px; border-radius: 7px; border: 1px solid var(--line); }
+  #legend .ticks { position: relative; height: 16px; margin-top: 2px; font-size: 12px; font-variant-numeric: tabular-nums; }
+  #legend .ticks span { position: absolute; transform: translateX(-50%); }
+  #legend .sw { display: inline-block; width: 14px; height: 14px; border-radius: 4px; vertical-align: -2px; margin-right: 4px; border: 1px solid rgba(255,255,255,0.25); }
+  #scrub { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+  #scrub input[type="range"] { flex: 1 1 180px; min-width: 120px; height: 44px; accent-color: var(--accent); }
+  #scrubLabel { font-size: 15px; font-weight: 600; min-width: 12ch; }
+  #scrub button { min-height: 44px; font-size: 15px; padding: 6px 12px; }
+  [hidden] { display: none !important; }
+  dialog { background: var(--panel); color: var(--text); border: 1px solid var(--line); border-radius: 16px; padding: 20px 24px; width: min(760px, 94vw); max-height: 90vh; overflow-y: auto; }
+  dialog::backdrop { background: rgba(4, 12, 18, 0.72); }
+  dialog h2 { margin: 0 0 6px; font-size: 24px; text-transform: none; letter-spacing: 0; color: var(--text); }
+  #testSummary { font-size: 20px; font-weight: 700; margin: 4px 0 12px; min-height: 1.4em; }
+  #testList { list-style: none; margin: 0 0 16px; padding: 0; }
+  #testList li { display: grid; grid-template-columns: 2em 1fr; gap: 2px 8px; padding: 9px 0; border-bottom: 1px solid var(--line); font-size: 17px; }
+  #testList li .mark { font-weight: 800; font-size: 20px; }
+  #testList li.pass .mark { color: var(--good); } #testList li.fail .mark { color: #ff7b72; } #testList li.run .mark { color: var(--accent); }
+  #testList li small { grid-column: 2; color: var(--dim); font-size: 14px; }
+  .sr-only { position: absolute; width: 1px; height: 1px; overflow: hidden; clip: rect(0 0 0 0); white-space: nowrap; }
+  #scnBtns { display: grid; grid-template-columns: 1fr; gap: 8px; }
+  #scnBtns button { text-align: left; min-height: 52px; }
+  #scnBtns button small { display: block; font-weight: 400; color: inherit; opacity: 0.8; font-size: 13px; }
+  #fixHead { display: flex; align-items: baseline; gap: 8px; }
+  #fixCredits { font-size: 40px; font-weight: 800; font-variant-numeric: tabular-nums; line-height: 1; }
+  #budgetBar { height: 8px; background: #10222d; border-radius: 4px; margin: 8px 0 10px; overflow: hidden; }
+  #budgetFill { display: block; height: 100%; background: var(--accent); border-radius: 4px; transition: width 0.3s; }
+  #fixBtns { display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 8px; }
+  #fixBtns button { min-height: 72px; font-size: 14px; line-height: 1.15; padding: 6px 4px; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 2px; }
+  #fixBtns button .ico { font-size: 22px; }
+  #fixBtns button small { font-weight: 400; opacity: 0.85; font-size: 12px; }
+  #map { display: block; border-radius: 14px; touch-action: none; cursor: crosshair;
+    box-shadow: 0 8px 30px rgba(0,0,0,0.45); background: #24566b; }
+  aside { background: var(--panel); border-left: 1px solid var(--line);
+    padding: 14px; overflow-y: auto; display: flex; flex-direction: column; gap: 14px; }
+  section.card { background: var(--panel2); border: 1px solid var(--line);
+    border-radius: 12px; padding: 12px 14px; }
+  section.card h2 { margin: 0 0 8px; font-size: 13px; font-weight: 600;
+    text-transform: uppercase; letter-spacing: 1.2px; color: var(--dim); }
+  #clock { font-size: 40px; font-weight: 700; font-variant-numeric: tabular-nums; line-height: 1.1; }
+  #date { font-size: 17px; color: var(--dim); margin-top: 2px; }
+  .row { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; }
+  button { min-height: 44px; min-width: 44px; padding: 8px 14px; font: inherit; font-size: 16px;
+    font-weight: 600; color: var(--text); background: #24465a; border: 1px solid var(--line);
+    border-radius: 10px; cursor: pointer; }
+  button:hover { background: #2c556c; }
+  button[aria-pressed="true"] { background: var(--accent); color: #1c1606; border-color: var(--accent); }
+  button:focus-visible, input:focus-visible { outline: 3px solid var(--accent); outline-offset: 2px; }
+  .speed button { flex: 1 1 0; }
+  label { font-size: 15px; color: var(--dim); }
+  input[type="number"] { min-height: 44px; width: 120px; padding: 6px 10px; font: inherit; font-size: 16px;
+    color: var(--text); background: #10222d; border: 1px solid var(--line); border-radius: 10px; }
+  dl { margin: 0; display: grid; grid-template-columns: auto 1fr; gap: 6px 12px; font-size: 16px; }
+  dt { color: var(--dim); } dd { margin: 0; text-align: right; font-variant-numeric: tabular-nums; white-space: nowrap; }
+  #probe { font-size: 15px; min-height: 1.4em; color: var(--dim); }
+  /* Health score */
+  #health { display: flex; align-items: center; gap: 14px; }
+  #healthNum { font-size: 68px; font-weight: 800; line-height: 1; font-variant-numeric: tabular-nums; min-width: 3.1ch; flex: none; text-align: center; }
+  #healthLabel { font-size: 22px; font-weight: 700; }
+  #healthParts { font-size: 13px; color: var(--dim); margin-top: 4px; line-height: 1.5; }
+  canvas.chart { display: block; width: 100%; height: 84px; margin-top: 8px; }
+  .legend { font-size: 12px; color: var(--dim); margin-top: 4px; }
+  /* Events */
+  #evBtns { display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 8px; }
+  #evBtns button { min-height: 66px; font-size: 14px; line-height: 1.15; padding: 6px 4px; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 2px; }
+  #evBtns button .ico { font-size: 22px; }
+  #evMsg { min-height: 1.5em; margin-top: 8px; font-size: 15px; color: var(--accent); }
+  /* Explain */
+  #exTitle { font-size: 18px; font-weight: 700; margin-bottom: 6px; }
+  #exLines p { margin: 0 0 8px; font-size: 16px; line-height: 1.4; }
+  #exChain { margin: 6px 0 0; padding: 0; list-style: none; font-size: 14px; border-left: 2px solid var(--line); }
+  #exChain li { padding: 3px 0 3px 12px; position: relative; color: var(--text); }
+  #exChain li::before { content: ""; position: absolute; left: -6px; top: 10px; width: 10px; height: 10px; border-radius: 50%; background: var(--accent); }
+  #exChain li.effect::before { background: #ec835a; }
+  #exChain li small { color: var(--dim); display: block; }
+  .gRow { margin-top: 10px; }
+  .gHead { display: flex; justify-content: space-between; font-size: 14px; }
+  .gHead b { font-weight: 600; } .gHead span { color: var(--dim); font-variant-numeric: tabular-nums; }
+  .gRow canvas { display: block; width: 100%; height: 54px; margin-top: 2px; }
+  /* Diary */
+  #diary { list-style: none; margin: 0; padding: 0; max-height: 260px; overflow-y: auto; font-size: 14px; }
+  #diary li { padding: 6px 0; border-bottom: 1px solid var(--line); }
+  #diary li small { color: var(--dim); display: block; }
+  #diary li.effect b { color: #f2a07a; } #diary li.action b { color: var(--good); }
+  /* Large screens and projectors: bigger type and a wider panel. */
+  @media (min-width: 1800px) {
+    main { grid-template-columns: minmax(0, 1fr) 500px; }
+    header h1 { font-size: 32px; } header .sub { font-size: 18px; }
+    section.card h2 { font-size: 15px; } button { font-size: 18px; } label, dl, #exLines p { font-size: 19px; }
+    #clock { font-size: 52px; } #date { font-size: 20px; } #healthNum { font-size: 84px; } #healthLabel { font-size: 28px; }
+    #caption { font-size: 26px; } #toast { font-size: 19px; } #legend { font-size: 17px; } #fixCredits { font-size: 48px; }
+    #exTitle { font-size: 22px; } #exChain, #diary { font-size: 16px; } #healthParts { font-size: 15px; } .gHead { font-size: 16px; }
+  }
+  @media (min-width: 2600px) {
+    main { grid-template-columns: minmax(0, 1fr) 720px; }
+    header h1 { font-size: 44px; } header .sub { font-size: 24px; }
+    section.card h2 { font-size: 20px; } button { font-size: 25px; min-height: 64px; } label, dl, #exLines p { font-size: 26px; }
+    #clock { font-size: 72px; } #date { font-size: 28px; } #healthNum { font-size: 116px; } #healthLabel { font-size: 38px; }
+    #caption { font-size: 36px; } #toast { font-size: 26px; } #legend { font-size: 23px; } #fixCredits { font-size: 66px; }
+    #exTitle { font-size: 30px; } #exChain, #diary { font-size: 22px; } #healthParts { font-size: 20px; } .gHead { font-size: 22px; }
+    #strip { min-height: 190px; } #toolbar button { font-size: 22px; min-height: 60px; } #budgetChip { font-size: 24px; }
+    #evBtns button, #fixBtns button, #scnBtns button { font-size: 21px; } canvas.chart { height: 120px; } .gRow canvas { height: 80px; }
+  }
+  /* Narrow screens: the panel moves below the map and the page scrolls. */
+  @media (max-width: 900px) {
+    body { height: auto; display: block; }
+    main { display: block; }
+    #mapWrap { padding: 8px; }
+    #caption { font-size: 18px; }
+    aside { border-left: 0; border-top: 1px solid var(--line); overflow: visible; }
+    header h1 { font-size: 22px; }
+  }
+</style>
+</head>
+<body>
+<header>
+  <h1>Bhoj</h1>
+  <span class="sub">A living Upper Lake, Bhopal</span>
+  <button id="selfTestBtn" title="Run the built-in quality checks">Self-test</button>
+</header>
+<main>
+  <div id="mapWrap">
+    <div id="toolbar">
+      <div id="layers" role="group" aria-label="Map layer">
+        <button data-layer="normal" aria-pressed="true">Normal</button>
+        <button data-layer="oxygen" aria-pressed="false">Oxygen</button>
+        <button data-layer="algae" aria-pressed="false">Algae</button>
+        <button data-layer="pollution" aria-pressed="false">Pollution</button>
+        <button data-layer="flow" aria-pressed="false">Flow</button>
+      </div>
+      <div class="right">
+        <button id="rewindBtn" aria-pressed="false" title="Replay how the lake got here">◀◀ Rewind</button>
+        <div id="budgetChip" title="Fix It budget">💰 100 credits</div>
+      </div>
+    </div>
+    <canvas id="map" aria-label="Map of the lake"></canvas>
+    <div id="strip">
+      <div id="toast" role="status" aria-live="polite"></div>
+      <div id="caption"></div>
+      <div id="legend"></div>
+      <div id="scrub" hidden>
+        <button id="scrubPlay" aria-pressed="false">▶ Play</button>
+        <input type="range" id="scrubRange" min="0" max="1" value="1" aria-label="Rewind position">
+        <span id="scrubLabel"></span>
+        <button id="scrubLive">Return to live</button>
+        <button id="scrubResume" title="Make this moment the present and carry on from here">Resume from here</button>
+      </div>
+    </div>
+  </div>
+  <aside>
+    <section class="card" aria-label="Time">
+      <h2>Time</h2>
+      <div class="row" style="justify-content:space-between;align-items:baseline"><div id="clock">06:00</div><div id="date">Day 1 · 1 Sep 2026</div></div>
+      <div class="row speed" role="group" aria-label="Simulation speed" style="margin-top:8px">
+        <button data-speed="0" aria-pressed="false" title="Pause (Space)">❚❚</button>
+        <button data-speed="1" aria-pressed="false">1×</button>
+        <button data-speed="10" aria-pressed="true">10×</button>
+        <button data-speed="100" aria-pressed="false">100×</button>
+      </div>
+    </section>
+    <section class="card" aria-label="Scenarios">
+      <h2>One-click stories</h2>
+      <div id="scnBtns">
+        <button data-scn="festival" aria-pressed="false">🪔 Festival Week<small>Immersion, rotting waste, clean-up</small></button>
+        <button data-scn="disaster" aria-pressed="false">🚰 Sewage Disaster<small>Pipes, heat wave, bloom, fish kill</small></button>
+        <button data-scn="recovery" aria-pressed="false">🌱 Recovery Story<small>A dying lake, fixed step by step</small></button>
+      </div>
+      <div class="legend">Each plays in about 60 seconds at 100×.</div>
+    </section>
+    <section class="card" aria-label="Lake health score">
+      <h2>Lake health</h2>
+      <div id="health"><div id="healthNum">100</div><div><div id="healthLabel">Healthy</div><div id="healthParts"></div></div></div>
+      <canvas id="scoreChart" class="chart" aria-label="Health score over time"></canvas>
+      <div class="legend">Score over the last 10 days · ▼ marks an event or action</div>
+    </section>
+    <section class="card" aria-label="Events">
+      <h2>Make something happen</h2>
+      <div id="evBtns">
+        <button data-ev="rain"><span class="ico">🌧</span>Heavy rain</button>
+        <button data-ev="sewage" aria-pressed="false"><span class="ico">🚰</span>Sewage pipe</button>
+        <button data-ev="immersion"><span class="ico">🪔</span>Idol immersion</button>
+        <button data-ev="heat"><span class="ico">🔥</span>Heat wave</button>
+        <button data-ev="drought"><span class="ico">🏜</span>Drought</button>
+      </div>
+      <div id="evMsg" class="sr-only" role="status"></div>
+    </section>
+    <section class="card" aria-label="Fix it">
+      <h2>Fix it</h2>
+      <div id="fixHead"><div id="fixCredits">100</div><div>credits left of 100</div></div>
+      <div id="budgetBar"><i id="budgetFill" style="width:100%"></i></div>
+      <div id="fixBtns">
+        <button data-fix="aerator" aria-pressed="false"><span class="ico">🫧</span>Aerator<small>8 · tap water</small></button>
+        <button data-fix="plant" aria-pressed="false"><span class="ico">🏭</span>Treatment plant<small>40 · tap a pipe</small></button>
+        <button data-fix="wetland" aria-pressed="false"><span class="ico">🌾</span>Wetland<small>15 · tap shore</small></button>
+        <button data-fix="ban" aria-pressed="false"><span class="ico">🚫</span>Ban immersion<small>10</small></button>
+        <button data-fix="crew" aria-pressed="false"><span class="ico">🧹</span>Clean-up crew<small>12 · one-off</small></button>
+      </div>
+      <div id="fixMsg" class="sr-only" role="status"></div>
+    </section>
+    <section class="card" aria-label="Explain">
+      <h2>Explain</h2>
+      <div id="exTitle">Tap the lake</div>
+      <div id="exLines"><p>Tap any spot on the water, or a fish, to see why it is the way it is.</p></div>
+      <ul id="exChain"></ul>
+      <div id="graphs" hidden>
+        <div class="gRow"><div class="gHead"><b style="color:#7dc4f0">Oxygen</b><span id="gvO"></span></div><canvas id="gO"></canvas></div>
+        <div class="gRow"><div class="gHead"><b style="color:#8fdc8a">Algae</b><span id="gvA"></span></div><canvas id="gA"></canvas></div>
+        <div class="gRow"><div class="gHead"><b style="color:#f5a35c">Temperature</b><span id="gvT"></span></div><canvas id="gT"></canvas></div>
+        <div class="gRow"><div class="gHead"><b style="color:#ece6d2">Fish nearby</b><span id="gvF"></span></div><canvas id="gF"></canvas></div>
+        <div class="legend">Last 5 days at this spot · ▼ marks an event or action</div>
+      </div>
+    </section>
+    <section class="card" aria-label="Diary">
+      <h2>Lake diary</h2>
+      <ul id="diary"><li>Nothing has happened yet.</li></ul>
+    </section>
+    <section class="card" aria-label="Lake">
+      <h2>Lake</h2>
+      <dl>
+        <dt>Oxygen avg · min</dt><dd id="statO">–</dd>
+        <dt>Algae (chlorophyll)</dt><dd id="statChl">–</dd>
+        <dt>Water temperature</dt><dd id="statT">–</dd>
+        <dt>Fish alive</dt><dd id="statFish">–</dd>
+        <dt>Wind</dt><dd id="statWind">–</dd>
+        <dt>Level · area</dt><dd id="statLevel">–</dd>
+        <dt>Sunlight</dt><dd id="statSun">–</dd>
+        <dt>Frame time</dt><dd id="statFrame">–</dd>
+      </dl>
+      <div id="probe" style="margin-top:8px">Move over the map.</div>
+    </section>
+    <section class="card" aria-label="Seed">
+      <h2>Repeatable runs</h2>
+      <div class="row">
+        <label for="seed">Seed</label>
+        <input id="seed" type="number" min="0" step="1" value="1100" inputmode="numeric">
+        <button id="restart">Restart</button>
+      </div>
+    </section>
+  </aside>
+</main>
+
+<dialog id="testDlg" aria-labelledby="testTitle">
+  <h2 id="testTitle">Self-test</h2>
+  <div id="testSummary" role="status"></div>
+  <ul id="testList"></ul>
+  <div class="row"><button id="testRun">Run again</button><button id="testClose">Close</button></div>
+</dialog>
+
+<!-- ======================================================================
+     SIMULATION CORE — no DOM access anywhere in this block.
+     ====================================================================== -->
+<script id="sim">
+(function (root) {
+  'use strict';
+
+  // ---------- 1. Constants and time scale ---------------------------------
+  var W = 160, H = 100, N = W * H;      // grid size (cells)
+  var STEP_MIN = 6;                     // one sim step = 6 sim-minutes
+  var STEPS_PER_DAY = 240;              // 24 h * 60 / 6
+  var START_HOUR = 6;                   // every run starts at 06:00
+  var MAX_DEPTH = 8;                    // metres, deepest part of the lake
+  var MIN_WET = 0.05;                   // a cell is "wet" above this depth (m)
+
+  // ---------- 2. Seeded randomness ----------------------------------------
+  // mulberry32: tiny, fast, good-enough PRNG. One 32-bit integer of state,
+  // so the whole random stream can be saved in a snapshot and replayed.
+  function mulberryValue(s) {           // turn a fresh 32-bit state into a number in [0, 1)
+    var t = Math.imul(s ^ (s >>> 15), 1 | s);
+    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  }
+  function mulberry32(seed) {           // closure form, used for world generation
+    var s = seed | 0;
+    return function () { s = (s + 0x6D2B79F5) | 0; return mulberryValue(s); };
+  }
+  // Runtime random numbers come from the sim's own state, never Math.random.
+  function rand(sim) {
+    sim.rngState = (sim.rngState + 0x6D2B79F5) | 0;
+    return mulberryValue(sim.rngState);
+  }
+
+  // Smooth value noise on a lattice, built from the seeded PRNG.
+  function makeNoise(rng) {
+    var perm = new Uint8Array(512), vals = new Float32Array(256), i, j, tmp;
+    for (i = 0; i < 256; i++) { perm[i] = i; vals[i] = rng(); }
+    for (i = 255; i > 0; i--) { j = (rng() * (i + 1)) | 0; tmp = perm[i]; perm[i] = perm[j]; perm[j] = tmp; }
+    for (i = 0; i < 256; i++) perm[i + 256] = perm[i];
+    function lattice(ix, iy) { return vals[perm[perm[ix & 255] + (iy & 255)]]; }
+    function noise2(x, y) {             // 0..1
+      var ix = Math.floor(x), iy = Math.floor(y), fx = x - ix, fy = y - iy;
+      var u = fx * fx * (3 - 2 * fx), v = fy * fy * (3 - 2 * fy);
+      var a = lattice(ix, iy), b = lattice(ix + 1, iy), c = lattice(ix, iy + 1), d = lattice(ix + 1, iy + 1);
+      return a + (b - a) * u + (c - a) * v + (a - b - c + d) * u * v;
+    }
+    function fbm(x, y, octaves) {       // roughly -1..1, several layers of detail
+      var sum = 0, amp = 1, norm = 0;
+      for (var o = 0; o < octaves; o++) {
+        sum += amp * (noise2(x, y) * 2 - 1); norm += amp;
+        x = x * 2 + 17.3; y = y * 2 + 9.1; amp *= 0.5;
+      }
+      return sum / norm;
+    }
+    return { noise2: noise2, fbm: fbm };
+  }
+
+  // ---------- 3. World generation -----------------------------------------
+  // The lake is described by one smooth "shape" value per cell: positive is
+  // lake, negative is land, zero is the shoreline. Bed depth is derived from
+  // it, so the lake is shallow at the edges and deep in the middle. Because
+  // the bed is a smooth surface, lowering the water level later (drought)
+  // makes the shoreline retreat naturally.
+  function createWorld(seed) {
+    seed = seed >>> 0;
+    var rng = mulberry32(seed), noise = makeNoise(rng);
+    var shape = new Float32Array(N), bed = new Float32Array(N);
+    var x, y, i, k;
+
+    // 3a. A long east-west basin, wider in the west, with a noisy shoreline.
+    var cx = W * 0.5 + (rng() - 0.5) * 6, cy = H * 0.5 + (rng() - 0.5) * 4;
+    for (y = 0; y < H; y++) for (x = 0; x < W; x++) {
+      var ry = 36 - 12 * (x / W), dx = (x - cx) / 62, dy = (y - cy) / ry;
+      var v = 1 - Math.sqrt(dx * dx + dy * dy) + 0.42 * noise.fbm(x * 0.035 + 11, y * 0.035 + 7, 4);
+      var edge = Math.min(x, y, W - 1 - x, H - 1 - y);
+      shape[y * W + x] = Math.min(v, (edge - 3) * 0.06);   // always land at the map border
+    }
+
+    // 3b. Two or three islands: pick deep, well-separated spots and raise them.
+    var islands = [];
+    for (k = 0; k < 400 && islands.length < 3; k++) {
+      var ix = Math.floor(W * (0.2 + 0.6 * rng())), iy = Math.floor(H * (0.3 + 0.4 * rng()));
+      var minShape = islands.length < 2 ? 0.4 : 0.5;
+      if (shape[iy * W + ix] < minShape) continue;
+      var far = true;
+      for (i = 0; i < islands.length; i++) {
+        if (Math.hypot(islands[i].x - ix, islands[i].y - iy) < 24) far = false;
+      }
+      if (far) islands.push({ x: ix, y: iy, r: 2.2 + rng() * 1.6 });
+    }
+    for (k = 0; k < islands.length; k++) {
+      var isl = islands[k], rad = Math.ceil(isl.r * 4);
+      for (y = Math.max(0, isl.y - rad); y <= Math.min(H - 1, isl.y + rad); y++)
+        for (x = Math.max(0, isl.x - rad); x <= Math.min(W - 1, isl.x + rad); x++) {
+          var d2 = (x - isl.x) * (x - isl.x) + (y - isl.y) * (y - isl.y);
+          shape[y * W + x] -= 1.6 * Math.exp(-d2 / (2 * isl.r * isl.r));
+        }
+    }
+
+    // 3c. Bed depth in metres (positive = below the full water line).
+    function bedFromShape(s, cellIndex) {
+      if (s <= 0) return s * 8;                              // land height above water
+      var cxn = (cellIndex % W) * 0.11, cyn = ((cellIndex / W) | 0) * 0.11;
+      return MAX_DEPTH * Math.pow(Math.min(1, s * 1.4), 0.85) * (0.88 + 0.12 * noise.noise2(cxn, cyn));
+    }
+    for (i = 0; i < N; i++) bed[i] = bedFromShape(shape[i], i);
+
+    // 3d. Keep only the largest connected body of water; fill in stray ponds.
+    var label = new Int32Array(N), stack = new Int32Array(N), best = 0, bestSize = 0, nextLabel = 0;
+    for (i = 0; i < N; i++) {
+      if (bed[i] <= MIN_WET || label[i]) continue;
+      var size = 0, top = 0; nextLabel++;
+      stack[top++] = i; label[i] = nextLabel;
+      while (top > 0) {
+        var c = stack[--top], px = c % W; size++;
+        if (px > 0 && !label[c - 1] && bed[c - 1] > MIN_WET) { label[c - 1] = nextLabel; stack[top++] = c - 1; }
+        if (px < W - 1 && !label[c + 1] && bed[c + 1] > MIN_WET) { label[c + 1] = nextLabel; stack[top++] = c + 1; }
+        if (c >= W && !label[c - W] && bed[c - W] > MIN_WET) { label[c - W] = nextLabel; stack[top++] = c - W; }
+        if (c < N - W && !label[c + W] && bed[c + W] > MIN_WET) { label[c + W] = nextLabel; stack[top++] = c + W; }
+      }
+      if (size > bestSize) { bestSize = size; best = nextLabel; }
+    }
+    for (i = 0; i < N; i++) {
+      if (bed[i] > 0 && label[i] !== best) { shape[i] = -0.01; bed[i] = -0.08; }
+    }
+
+    // 3e. Landmarks. River inflow on the west, outlet spillway on the
+    // south-east, the immersion ghat on the north shore.
+    var minX = W, maxScore = -1e9, outlet = { x: 0, y: 0 }, col = [];
+    for (i = 0; i < N; i++) if (bed[i] > MIN_WET && i % W < minX) minX = i % W;
+    for (y = 0; y < H; y++) if (bed[y * W + minX] > MIN_WET) col.push(y);
+    var inflow = { x: minX, y: col[(col.length / 2) | 0] };
+    for (i = 0; i < N; i++) {
+      if (bed[i] <= MIN_WET) continue;
+      var sc = (i % W) + 0.6 * ((i / W) | 0);
+      if (sc > maxScore) { maxScore = sc; outlet = { x: i % W, y: (i / W) | 0 }; }
+    }
+    var ghat = null;
+    for (var tryCol = 0; tryCol < W && !ghat; tryCol++) {     // start near 62% across, widen if needed
+      var gx = Math.round(W * 0.62) + (tryCol % 2 ? 1 : -1) * ((tryCol + 1) >> 1);
+      if (gx < 4 || gx > W - 5) continue;
+      for (y = 1; y < H; y++) if (bed[y * W + gx] > MIN_WET) { ghat = { x: gx, y: y }; break; }
+    }
+    if (!ghat) ghat = { x: inflow.x, y: inflow.y };
+
+    // 3f. Scenery positions (drawn by the UI; they do not affect the science).
+    function wigglyPath(x0, y0, x1, y1, amp) {
+      var pts = [], phase = rng() * 6.28, n = 14;
+      for (var s = 0; s <= n; s++) {
+        var t = s / n, fade = Math.sin(Math.PI * t);         // no wiggle at the ends
+        pts.push({ x: x0 + (x1 - x0) * t, y: y0 + (y1 - y0) * t + amp * fade * Math.sin(phase + t * 7) });
+      }
+      return pts;
+    }
+    var river = wigglyPath(-2, inflow.y + (rng() - 0.5) * 16, inflow.x + 0.5, inflow.y, 2.2);
+    var spill = wigglyPath(outlet.x - 0.5, outlet.y, W + 2, Math.min(H - 6, outlet.y + 6 + rng() * 6), 1.5);
+
+    var buildings = [];
+    for (k = 0; k < 600 && buildings.length < 16; k++) {      // a small town behind the ghat
+      var bx = ghat.x + 9 + (rng() + rng() + rng() - 1.5) * 26, by = ghat.y - 7 + (rng() + rng() + rng() - 1.5) * 12;
+      if (bx < 5 || bx > W - 6 || by < 5 || by > H - 6) continue;
+      if (shape[Math.round(by) * W + Math.round(bx)] > -0.07) continue;
+      var clear = Math.hypot(ghat.x - bx, ghat.y - 4 - by) > 4.5;
+      for (i = 0; i < islands.length; i++) if (Math.hypot(islands[i].x - bx, islands[i].y - by) < 10) clear = false;
+      for (i = 0; i < buildings.length; i++) if (Math.hypot(buildings[i].x - bx, buildings[i].y - by) < 3.6) clear = false;
+      if (clear) buildings.push({ x: bx, y: by, w: 1.7 + rng() * 1.1, h: 1.5 + rng() * 0.9, a: (rng() - 0.5) * 0.5, c: (rng() * 4) | 0 });
+    }
+    var trees = [];
+    for (k = 0; k < 5000 && trees.length < 320; k++) {
+      var tx = 2 + rng() * (W - 4), ty = 2 + rng() * (H - 4), ts = shape[Math.round(ty) * W + Math.round(tx)];
+      if (ts > -0.035 || ts < -0.6) continue;
+      if (noise.noise2(tx * 0.09 + 40, ty * 0.09 + 3) < 0.42) continue;   // groves, not an even sprinkle
+      var ok = true;
+      for (i = 0; i < buildings.length; i++) if (Math.hypot(buildings[i].x - tx, buildings[i].y - ty) < 2.6) ok = false;
+      if (Math.hypot(ghat.x - tx, ghat.y - 2 - ty) < 5) ok = false;
+      if (ok) trees.push({ x: tx, y: ty, r: 0.55 + rng() * 0.55, c: (rng() * 4) | 0 });
+    }
+    trees.sort(function (a, b) { return a.y - b.y; });       // draw back to front
+
+    return {
+      W: W, H: H, N: N, seed: seed, shape: shape, bed: bed, noise: noise,
+      islands: islands, inflow: inflow, outlet: outlet, ghat: ghat,
+      river: river, spill: spill, buildings: buildings, trees: trees
+    };
+  }
+
+  // ---------- 4. Simulation state -----------------------------------------
+  // UNITS. One grid cell is about 80 m across. Every cell has the same area,
+  // so a cell's water "volume" is simply its depth in metres. Concentrations
+  // are mg/L. Nutrients (N), algae (A) and detritus (D) are all counted in
+  // mg of nutrient per litre, so the nutrient budget adds up exactly:
+  //   total nutrient = sum over cells of (N + A + D) x volume + sediment organics.
+  // People see algae as chlorophyll: 1 mg/L of algal nutrient ~ 150 ug/L.
+  var VMIN = 0.3;                       // floor on a cell's volume so thin shallows stay stable
+  var CHL = 150;                        // ug/L chlorophyll per mg/L of algal nutrient
+  // Origin tags: the nutrient pool (N + A + D) in each cell is split by where
+  // it came from. They travel with the water exactly like the nutrients do,
+  // so any patch of algae can say whose nutrients it grew on.
+  var TAGS = ['Ms', 'Mr', 'Mi', 'Mb', 'Md'];
+  var TAG_NAMES = ['sewage', 'rain runoff', 'idol immersion', 'the river and natural sources', 'the lake bed'];
+  var TAG_EVENT = ['sewage', 'rain', 'immersion', null, null];
+  var FIELDS = ['N', 'A', 'D', 'P', 'O', 'T', 'Ms', 'Mr', 'Mi', 'Mb', 'Md'];   // everything the water carries
+  var CONSERVED = ['N', 'A', 'D', 'P', 'Ms', 'Mr', 'Mi', 'Mb', 'Md'];         // concentrate when water evaporates
+
+  // Every tunable number lives here, so the model can be explained and tuned in one place.
+  var PAR = {
+    muMax: 4.0,       // algae: maximum growth per day at 20 C in full light
+    ks: 0.04,         // algae: nutrient level (mg/L) at which growth runs at half speed
+    theta: 1.07,      // biology speeds up about 7% per degree C
+    resp: 0.35,       // algae: respiration per day (burns biomass and oxygen, day and night)
+    death: 0.05,      // algae: natural death per day
+    crowd: 0.10,      // algae: extra death per day per mg/L of algae (dense blooms collapse)
+    decay: 0.25,      // detritus: decay per day at 20 C (uses oxygen, frees nutrients)
+    settle: 0.35,     // detritus: sinking speed, metres per day
+    sedDecay: 0.04,   // sediment organics: decay per day at 20 C
+    sedRelease: 0.06, // sediment: extra nutrient release per day when the water above is anoxic
+    burial: 0.10,     // sediment: permanent burial per day (leaves the system)
+    bgN: 0.050,       // natural background supply (groundwater, dust, birds), mg/L per day, evenly over the lake
+    denit: 0.60,      // dissolved nutrient lost to the air per day at 20 C (denitrification)
+    o2PerN: 15,       // mg of oxygen made or used per mg of nutrient fixed or burned
+    sod: 0.25,        // background sediment oxygen demand, g per m2 per day
+    pBackground: 6,   // turbidity the lake settles back to (NTU)
+    pSettle: 0.5,     // turbidity settling speed, metres per day
+    windDrive: 0.006, // how strongly wind pushes the water
+    diff: 0.05,       // horizontal mixing between neighbouring cells
+    riverQ: 0.8,      // river through-flow, cell-metres per step (about a 100-day residence time)
+    tMean: 27, tSwing: 3.5, heatRate: 0.9,   // air temperature (C) and how fast water follows it
+    riverN: 0.10, riverA: 0.01, riverD: 0.02, riverP: 12, riverO: 7.6,
+    // events
+    sewageLoad: 6,          // nutrient mass per step from one untreated pipe
+    sewageDissolved: 0.92,  // share of it dissolved; the rest is organic solids (BOD)
+    runoffLoad: 2.4,        // nutrient mass per step washed in along the whole shore during heavy rain
+    immersionLoad: 8.0,     // nutrient mass per step at the ghat during the 12-hour immersion (half dissolved, half organic)
+    heatWave: 6,            // degrees added to the air during a heat wave
+    aerPeak: 18,            // oxygen added at the centre of an aerator (mg/L per day)
+    aerSigma: 2.5           // aerator reach, in cells
+  };
+  var COST = { aerator: 8, plant: 40, wetland: 15, ban: 10, crew: 12 };   // Fix It prices in credits
+  var COST_NAME = { aerator: 'An aerator', plant: 'A treatment plant', wetland: 'A wetland buffer', ban: 'The immersion ban', crew: 'A clean-up crew' };
+
+  function createSim(seed, opts) {          // opts.noSnaps: skip Rewind history (used by the self-test copies)
+    seed = seed >>> 0;
+    var world = createWorld(seed), F2 = 2 * N;
+    var sim = {
+      world: world, seed: seed, noSnaps: !!(opts && opts.noSnaps),
+      t: 0,                              // steps since the start (integer)
+      level: 0,                          // water level relative to full (m); negative in drought
+      levelPending: 0,                   // level change waiting to be applied (see processEvents)
+      rngState: (seed ^ 0x9E3779B9) | 0, // runtime random stream
+      wet: new Uint8Array(N),            // 1 where there is water right now
+      depth: new Float32Array(N),        // water depth in metres (0 on land)
+      vol: new Float32Array(N),          // volume used for mixing (depth, floored at VMIN)
+      wetList: new Int32Array(N), wetCount: 0, fullWetCount: 0,
+      // water quality, one value per cell
+      N: new Float32Array(N),            // dissolved nutrients (mg/L)
+      A: new Float32Array(N),            // algae (mg/L of nutrient held in algae)
+      D: new Float32Array(N),            // detritus: dead algae and fish (mg/L of nutrient)
+      P: new Float32Array(N),            // turbidity and pollution (NTU)
+      O: new Float32Array(N),            // dissolved oxygen (mg/L)
+      T: new Float32Array(N),            // water temperature (C)
+      sed: new Float32Array(N),          // organic matter on the bed (nutrient mass per cell)
+      Ms: new Float32Array(N), Mr: new Float32Array(N), Mi: new Float32Array(N), Mb: new Float32Array(N), Md: new Float32Array(N),
+      // oxygen budget per cell, a running average over the last sim-day (mg/L per day)
+      bPhoto: new Float32Array(N), bResp: new Float32Array(N), bDecay: new Float32Array(N),
+      bSed: new Float32Array(N), bRear: new Float32Array(N), bAer: new Float32Array(N),
+      aer: new Float32Array(N),          // oxygen added by aerators (mg/L per day)
+      shore: new Int32Array(N), shoreCount: 0,
+      // flow: one entry per open face between two wet neighbours
+      faceI: new Int32Array(F2), faceJ: new Int32Array(F2), faceH: new Float32Array(F2),
+      faceX: new Uint8Array(F2),         // 1 = east-west face, 0 = north-south face
+      faceF: new Float32Array(F2),       // volume flux this step, positive toward east / south
+      basisX: new Float32Array(F2), basisY: new Float32Array(F2), basisQ: new Float32Array(F2),
+      faceCount: 0, subSteps: 1, maxSpeed: 0,
+      cE: new Float32Array(N), cW: new Float32Array(N), cN: new Float32Array(N), cS: new Float32Array(N),
+      pX: new Float64Array(N), pY: new Float64Array(N), pQ: new Float64Array(N), rhs: new Float64Array(N),
+      inCells: [], outCells: [],         // river inflow and outlet patches
+      dm: new Float64Array(N), scratch: new Float32Array(N), scratchWet: new Uint8Array(N),
+      weather: { wind: 2.5, windDir: 0.25, gust: 0, windBoost: 0, cloud: 0.25, cloudTarget: 0.25,
+                 rain: 0, airT: PAR.tMean, heat: 0, riverFactor: 1 },
+      // nutrient ledger: every source and sink, so conservation can be proven
+      ledger: { start: 0, riverIn: 0, outflow: 0, burial: 0, carcass: 0, rewet: 0, dried: 0, added: 0, removed: 0 },
+      stats: { meanO: 0, minO: 0, meanChl: 0, maxChl: 0, meanT: 0, meanP: 0, meanN: 0 }
+    };
+    refreshWet(sim);
+    sim.fullWetCount = sim.wetCount;
+    for (var i = 0; i < N; i++) {        // a healthy, clear lake to start from
+      sim.T[i] = 27.5; sim.O[i] = 7.6; sim.P[i] = PAR.pBackground;
+      sim.N[i] = 0.025; sim.A[i] = 0.055; sim.D[i] = 0.02;
+      sim.sed[i] = sim.wet[i] ? 0.1 : 0;     // in balance with settling, so a calm lake stays calm
+      sim.Mb[i] = sim.N[i] + sim.A[i] + sim.D[i];
+      sim.bPhoto[i] = sim.bResp[i] = 1;
+    }
+    rebuildFlow(sim, 900);
+    sim.fish = createFish(sim);
+    sim.ledger.start = totalNutrient(sim);
+    sim.ev = createEvents();
+    sim.hist = createHistory();
+    computeStats(sim);
+    sim.score = sim.scoreSmooth = healthScore(sim);
+    recordHistory(sim);
+    sim.snaps = { slots: [], head: 0, count: 0 };
+    takeSnapshot(sim);
+    return sim;
+  }
+
+  // Recompute which cells are under water for the current level.
+  function refreshWet(sim) {
+    var bed = sim.world.bed, count = 0;
+    for (var i = 0; i < N; i++) {
+      var x = i % W, y = (i / W) | 0, d = bed[i] + sim.level;
+      if (d > MIN_WET && x > 1 && y > 1 && x < W - 2 && y < H - 2) {
+        sim.wet[i] = 1; sim.depth[i] = d; sim.vol[i] = d > VMIN ? d : VMIN; sim.wetList[count++] = i;
+      } else { sim.wet[i] = 0; sim.depth[i] = 0; sim.vol[i] = 0; }
+    }
+    sim.wetCount = count;
+  }
+
+  function nearestWetCell(sim, i0, radius) {   // closest wet cell within a radius, or -1
+    var x0 = i0 % W, y0 = (i0 / W) | 0;
+    for (var r = 1; r <= radius; r++)
+      for (var dy = -r; dy <= r; dy++) for (var dx = -r; dx <= r; dx++) {
+        if (Math.max(Math.abs(dx), Math.abs(dy)) !== r) continue;
+        var x = x0 + dx, y = y0 + dy;
+        if (x >= 0 && y >= 0 && x < W && y < H && sim.wet[y * W + x]) return y * W + x;
+      }
+    return -1;
+  }
+
+  // Raise or lower the whole lake. Material is conserved: when water
+  // evaporates the same nutrients sit in less water (concentrations rise);
+  // cells that dry out hand their contents to a wet neighbour.
+  function setLevel(sim, level) {
+    level = Math.max(-MAX_DEPTH * 0.8, Math.min(0.6, level));
+    if (level === sim.level) return;
+    var oldVol = sim.scratch, oldWet = sim.scratchWet, i, j, k, C, changed = false;
+    oldVol.set(sim.vol); oldWet.set(sim.wet);
+    sim.level = level; refreshWet(sim);
+    var wet = sim.wet, vol = sim.vol, L = sim.ledger;
+    for (i = 0; i < N; i++) {                                  // 1. same cell, new volume
+      if (oldWet[i] !== wet[i]) changed = true;
+      if (oldWet[i] && wet[i] && oldVol[i] !== vol[i]) {
+        var r = oldVol[i] / vol[i];
+        for (k = 0; k < CONSERVED.length; k++) sim[CONSERVED[k]][i] *= r;
+      }
+    }
+    if (changed) {
+      for (i = 0; i < N; i++) {                                // 2. cells that dried out
+        if (!oldWet[i] || wet[i]) continue;
+        j = nearestWetCell(sim, i, 4);
+        if (j < 0) L.dried += (sim.N[i] + sim.A[i] + sim.D[i]) * oldVol[i];
+        for (k = 0; k < CONSERVED.length; k++) {
+          C = sim[CONSERVED[k]];
+          if (j >= 0) C[j] += C[i] * oldVol[i] / vol[j];
+          C[i] = 0;
+        }
+      }
+      for (i = 0; i < N; i++) {                                // 3. newly flooded cells
+        if (oldWet[i] || !wet[i]) continue;
+        var nb = [i - 1, i + 1, i - W, i + W], cnt = 0;
+        for (k = 0; k < FIELDS.length; k++) sim[FIELDS[k]][i] = 0;
+        for (j = 0; j < 4; j++) {
+          if (!oldWet[nb[j]] || !wet[nb[j]]) continue;
+          cnt++;
+          for (k = 0; k < FIELDS.length; k++) sim[FIELDS[k]][i] += sim[FIELDS[k]][nb[j]];
+        }
+        if (cnt) for (k = 0; k < FIELDS.length; k++) sim[FIELDS[k]][i] /= cnt;
+        else { sim.N[i] = PAR.riverN; sim.A[i] = PAR.riverA; sim.D[i] = PAR.riverD; sim.P[i] = PAR.riverP; sim.O[i] = PAR.riverO; sim.T[i] = PAR.tMean; }
+        L.rewet += (sim.N[i] + sim.A[i] + sim.D[i]) * vol[i];
+      }
+      rebuildFlow(sim, 160);
+      strandFish(sim);
+    }
+  }
+
+  // Total nutrient in the system: water plus sediment.
+  function totalNutrient(sim) {
+    var s = 0, i, k;
+    for (k = 0; k < sim.wetCount; k++) { i = sim.wetList[k]; s += (sim.N[i] + sim.A[i] + sim.D[i]) * sim.vol[i]; }
+    for (i = 0; i < N; i++) s += sim.sed[i];
+    return s;
+  }
+  // Relative gap between what the lake holds and what the ledger says it should hold.
+  function ledgerError(sim) {
+    var L = sim.ledger;
+    var expected = L.start + L.riverIn + L.carcass + L.rewet + L.added - L.outflow - L.burial - L.dried - L.removed;
+    return (totalNutrient(sim) - expected) / Math.max(1e-9, expected);
+  }
+  // Add nutrient mass spread over wet cells within a radius (used by events and tests).
+  // field 'N' = dissolved nutrients; 'D' = organic matter (sewage solids, BOD).
+  function addNutrient(sim, cx, cy, radius, mass, field, tag) {
+    var C = sim[field === 'D' ? 'D' : 'N'], M = sim[TAGS[tag === undefined ? 3 : tag]];
+    var cells = [], i, x, y, r2 = radius * radius, v = 0;
+    for (y = Math.max(0, Math.floor(cy - radius)); y <= Math.min(H - 1, Math.ceil(cy + radius)); y++)
+      for (x = Math.max(0, Math.floor(cx - radius)); x <= Math.min(W - 1, Math.ceil(cx + radius)); x++) {
+        i = y * W + x;
+        if (sim.wet[i] && (x - cx) * (x - cx) + (y - cy) * (y - cy) <= r2) { cells.push(i); v += sim.vol[i]; }
+      }
+    if (!cells.length) { i = nearestWetCell(sim, Math.round(cy) * W + Math.round(cx), 12); if (i < 0) return 0; cells.push(i); v = sim.vol[i]; }
+    for (var k = 0; k < cells.length; k++) { C[cells[k]] += mass / v; M[cells[k]] += mass / v; }
+    sim.ledger.added += mass;
+    return mass;
+  }
+
+  // ---------- 5. One simulation step (6 sim-minutes) -----------------------
+  // 5a. Flow. Currents come from wind dragging the surface and the river
+  // flowing through from inlet to outlet. Water cannot pile up in a cell, so
+  // the raw wind push is corrected by a "pressure" field that makes each
+  // cell's inflow equal its outflow (a projection, solved by over-relaxed
+  // Gauss-Seidel). The correction is linear, so we solve it once for an
+  // eastward unit wind, a southward unit wind and a unit river flow; each
+  // step simply mixes those three patterns. Over uneven depth this produces
+  // real lake circulation: downwind along the shallows, back through the deep.
+  function nearestWetList(sim, px, py, k, comp) {
+    var best = [];
+    for (var w = 0; w < sim.wetCount; w++) {
+      var i = sim.wetList[w];
+      if (comp && !comp[i]) continue;
+      var dx = i % W - px, dy = ((i / W) | 0) - py, d2 = dx * dx + dy * dy;
+      if (best.length < k || d2 < best[best.length - 1].d2) {
+        best.push({ i: i, d2: d2 });
+        best.sort(function (a, b) { return a.d2 - b.d2; });
+        if (best.length > k) best.pop();
+      }
+    }
+    return best.map(function (b) { return b.i; });
+  }
+
+  function rebuildFlow(sim, iters) {
+    var wet = sim.wet, d = sim.depth, n = 0, i, h, w;
+    sim.cE.fill(0); sim.cW.fill(0); sim.cN.fill(0); sim.cS.fill(0);
+    for (w = 0; w < sim.wetCount; w++) {
+      i = sim.wetList[w];
+      if (wet[i + 1]) {
+        h = Math.max(0.2, Math.min(d[i], d[i + 1]));
+        sim.faceI[n] = i; sim.faceJ[n] = i + 1; sim.faceH[n] = h; sim.faceX[n] = 1; sim.cE[i] = h; sim.cW[i + 1] = h; n++;
+      }
+      if (wet[i + W]) {
+        h = Math.max(0.2, Math.min(d[i], d[i + W]));
+        sim.faceI[n] = i; sim.faceJ[n] = i + W; sim.faceH[n] = h; sim.faceX[n] = 0; sim.cS[i] = h; sim.cN[i + W] = h; n++;
+      }
+    }
+    sim.faceCount = n;
+    // Shore cells: water with land next to it (where runoff enters).
+    var sc = 0;
+    for (w = 0; w < sim.wetCount; w++) {
+      i = sim.wetList[w];
+      if (!wet[i - 1] || !wet[i + 1] || !wet[i - W] || !wet[i + W]) sim.shore[sc++] = i;
+    }
+    sim.shoreCount = sc;
+    // River patches. The outlet patch must be in the same body of water as
+    // the inflow, otherwise (after a severe drought splits the lake) the
+    // river cannot flow through and is switched off.
+    sim.inCells = []; sim.outCells = [];
+    if (sim.wetCount > 40) {
+      var wd = sim.world;
+      sim.inCells = nearestWetList(sim, wd.inflow.x, wd.inflow.y, 8, null);
+      var comp = sim.scratchWet; comp.fill(0);
+      var stack = [sim.inCells[0]]; comp[stack[0]] = 1;
+      while (stack.length) {
+        var c = stack.pop(), nb = [c - 1, c + 1, c - W, c + W];
+        for (var k = 0; k < 4; k++) if (wet[nb[k]] && !comp[nb[k]]) { comp[nb[k]] = 1; stack.push(nb[k]); }
+      }
+      var inSet = {}, k2;
+      for (k2 = 0; k2 < sim.inCells.length; k2++) inSet[sim.inCells[k2]] = 1;
+      sim.outCells = nearestWetList(sim, wd.outlet.x, wd.outlet.y, 8, comp).filter(function (c) { return !inSet[c]; });
+      if (!sim.outCells.length) sim.inCells = [];
+    }
+    solveBasis(sim, sim.pX, sim.basisX, 1, 0, 0, iters);
+    solveBasis(sim, sim.pY, sim.basisY, 0, 1, 0, iters);
+    solveBasis(sim, sim.pQ, sim.basisQ, 0, 0, sim.inCells.length ? 1 : 0, iters);
+  }
+
+  function solveBasis(sim, p, out, fx, fy, q, iters) {
+    var n = sim.faceCount, rhs = sim.rhs, I = sim.faceI, J = sim.faceJ, X = sim.faceX, H_ = sim.faceH;
+    var cE = sim.cE, cW = sim.cW, cN = sim.cN, cS = sim.cS, wl = sim.wetList, wc = sim.wetCount, f, i, k, s;
+    for (k = 0; k < wc; k++) rhs[wl[k]] = 0;
+    for (f = 0; f < n; f++) { s = X[f] ? fx : fy; rhs[I[f]] -= s; rhs[J[f]] += s; }   // minus divergence of the push
+    if (q) {
+      for (k = 0; k < sim.inCells.length; k++) rhs[sim.inCells[k]] += q / sim.inCells.length;
+      for (k = 0; k < sim.outCells.length; k++) rhs[sim.outCells[k]] -= q / sim.outCells.length;
+    }
+    for (var it = 0; it < iters; it++) {
+      for (k = 0; k < wc; k++) {
+        i = wl[k];
+        var cs = cE[i] + cW[i] + cN[i] + cS[i];
+        if (cs === 0) continue;
+        var pn = (rhs[i] + cE[i] * p[i + 1] + cW[i] * p[i - 1] + cS[i] * p[i + W] + cN[i] * p[i - W]) / cs;
+        p[i] += 1.9 * (pn - p[i]);
+      }
+    }
+    for (f = 0; f < n; f++) out[f] = (X[f] ? fx : fy) - H_[f] * (p[J[f]] - p[I[f]]);
+  }
+
+  function updateFlow(sim) {
+    var w = sim.weather, n = sim.faceCount, F = sim.faceF, bX = sim.basisX, bY = sim.basisY, bQ = sim.basisQ, H_ = sim.faceH;
+    var wx = Math.cos(w.windDir) * w.wind * PAR.windDrive, wy = Math.sin(w.windDir) * w.wind * PAR.windDrive;
+    var q = sim.inCells.length ? PAR.riverQ * w.riverFactor : 0, maxV = 0;
+    for (var f = 0; f < n; f++) {
+      var v = wx * bX[f] + wy * bY[f] + q * bQ[f];
+      F[f] = v;
+      v = Math.abs(v) / H_[f]; if (v > maxV) maxV = v;
+    }
+    sim.maxSpeed = maxV;                 // cells per step, fastest current anywhere
+  }
+
+  // 5b. Transport. Flux form: whatever leaves one cell enters its neighbour,
+  // so moving water can never create or destroy material. "Upwind" takes the
+  // value from the cell the water comes from, which keeps every field
+  // positive; sub-steps keep it stable when currents are strong.
+  function planSubsteps(sim) {
+    var out = sim.dm, n = sim.faceCount, F = sim.faceF, I = sim.faceI, J = sim.faceJ, H_ = sim.faceH;
+    var wl = sim.wetList, wc = sim.wetCount, K = PAR.diff, k, f, worst = 0;
+    for (k = 0; k < wc; k++) out[wl[k]] = 0;
+    for (f = 0; f < n; f++) {
+      var a = F[f], d = K * H_[f];
+      if (a > 0) { out[I[f]] += a + d; out[J[f]] += d; } else { out[J[f]] += d - a; out[I[f]] += d; }
+    }
+    var qo = sim.outCells.length ? PAR.riverQ * sim.weather.riverFactor / sim.outCells.length : 0;
+    for (k = 0; k < sim.outCells.length; k++) out[sim.outCells[k]] += qo;
+    for (k = 0; k < wc; k++) { var r = out[wl[k]] / sim.vol[wl[k]]; if (r > worst) worst = r; out[wl[k]] = 0; }
+    sim.subSteps = Math.min(24, Math.max(1, Math.ceil(worst / 0.45)));
+  }
+
+  var flowIn = 0, flowOut = 0;          // river mass in / out during the last transportField call
+  function transportField(sim, C, cin) {
+    var ns = sim.subSteps, inv = 1 / ns, dm = sim.dm, n = sim.faceCount, F = sim.faceF, I = sim.faceI, J = sim.faceJ, H_ = sim.faceH;
+    var wl = sim.wetList, wc = sim.wetCount, vol = sim.vol, K = PAR.diff * inv, k, f, i, j;
+    var inC = sim.inCells, outC = sim.outCells;
+    var qi = inC.length ? PAR.riverQ * sim.weather.riverFactor / inC.length * inv : 0;
+    var qo = outC.length ? PAR.riverQ * sim.weather.riverFactor / outC.length * inv : 0;
+    flowIn = 0; flowOut = 0;
+    for (var s = 0; s < ns; s++) {
+      for (f = 0; f < n; f++) {
+        i = I[f]; j = J[f];
+        var a = F[f] * inv, ci = C[i], cj = C[j];
+        var flux = (a > 0 ? a * ci : a * cj) + K * H_[f] * (ci - cj);
+        dm[i] -= flux; dm[j] += flux;
+      }
+      for (k = 0; k < inC.length; k++) { dm[inC[k]] += qi * cin; flowIn += qi * cin; }
+      for (k = 0; k < outC.length; k++) { var m = qo * C[outC[k]]; dm[outC[k]] -= m; flowOut += m; }
+      for (k = 0; k < wc; k++) { i = wl[k]; C[i] += dm[i] / vol[i]; dm[i] = 0; }
+    }
+  }
+
+  function transportAll(sim) {
+    var w = sim.weather, L = sim.ledger;
+    planSubsteps(sim);
+    transportField(sim, sim.N, PAR.riverN); L.riverIn += flowIn; L.outflow += flowOut;
+    transportField(sim, sim.A, PAR.riverA); L.riverIn += flowIn; L.outflow += flowOut;
+    transportField(sim, sim.D, PAR.riverD); L.riverIn += flowIn; L.outflow += flowOut;
+    transportField(sim, sim.P, PAR.riverP);
+    transportField(sim, sim.O, PAR.riverO);
+    transportField(sim, sim.T, PAR.tMean - 1 + w.heat * 0.5);
+    transportField(sim, sim.Ms, 0); transportField(sim, sim.Mr, 0); transportField(sim, sim.Mi, 0);
+    transportField(sim, sim.Mb, PAR.riverN + PAR.riverA + PAR.riverD); transportField(sim, sim.Md, 0);
+  }
+
+  // 5c. Weather: wind, clouds and air temperature, all from the seeded stream.
+  function updateWeather(sim) {
+    var w = sim.weather, hour = sun(sim.t).hour;
+    // Prevailing westerly (blowing toward the east, angle 0), slowly wandering,
+    // and stronger in the afternoon as the land heats up.
+    w.windDir += (rand(sim) - 0.5) * 0.06 + (0.25 - w.windDir) * 0.003;
+    w.gust += (rand(sim) - 0.5) * 0.25 - w.gust * 0.03;
+    var target = 2.2 + 1.6 * Math.max(0, Math.sin((hour - 9) / 12 * Math.PI)) + w.gust + w.windBoost;
+    w.wind += (Math.max(0.3, target) - w.wind) * 0.04;
+    w.cloud += (rand(sim) - 0.5) * 0.04 + (w.cloudTarget - w.cloud) * 0.01;
+    w.cloud = w.cloud < 0 ? 0 : w.cloud > 1 ? 1 : w.cloud;
+    // Warmest at 15:00, coolest at 03:00; a heat wave adds on top; rain cools.
+    w.airT = PAR.tMean + PAR.tSwing * Math.sin((hour - 9) / 24 * 2 * Math.PI) + w.heat - 3 * w.rain;
+  }
+
+  // Oxygen the water can hold when saturated (mg/L), falls as water warms.
+  function oxygenSaturation(t) {
+    return 14.62 - 0.3898 * t + 0.006969 * t * t - 0.00005897 * t * t * t;
+  }
+
+  // 5d. Water quality: the causal chain, cell by cell.
+  //   nutrients + sunlight + warmth -> algae grow and make oxygen (daytime only)
+  //   algae respire all the time    -> oxygen falls at night
+  //   algae die                     -> detritus, which decays using oxygen
+  //   detritus sinks                -> sediment, which keeps using oxygen and,
+  //                                    once the water above is anoxic, releases
+  //                                    its nutrients back (feeding more algae)
+  //   wind stirs air into the water -> reaeration toward saturation
+  function react(sim) {
+    var dt = 1 / STEPS_PER_DAY, w = sim.weather, sn = sun(sim.t), L = sim.ledger;
+    var I0 = sn.light * (1 - 0.55 * w.cloud);                  // light reaching the surface, 0..1
+    var piston = 0.4 + 0.06 * w.wind * w.wind;                 // reaeration speed, metres per day
+    var tAir = w.airT + 2.5 * sn.light * (1 - 0.5 * w.cloud);  // sunlight warms the water too
+    var wl = sim.wetList, wc = sim.wetCount, Nn = sim.N, A = sim.A, D = sim.D, O = sim.O, T = sim.T, P = sim.P;
+    var sed = sim.sed, depth = sim.depth, vol = sim.vol, o2 = PAR.o2PerN, burialSum = 0;
+    var Ms = sim.Ms, Mr = sim.Mr, Mi = sim.Mi, Mb = sim.Mb, Md = sim.Md, aer = sim.aer, EMA = 1 / STEPS_PER_DAY;
+    var bPhoto = sim.bPhoto, bResp = sim.bResp, bDecay = sim.bDecay, bSed = sim.bSed, bRear = sim.bRear, bAer = sim.bAer;
+    var sO = 0, minO = 1e9, sChl = 0, maxA = 0, sT = 0, sP = 0, sN = 0;
+    for (var k = 0; k < wc; k++) {
+      var i = wl[k], h = depth[i], v = vol[i];
+      var n = Nn[i], a = A[i], d = D[i], o = O[i], t = T[i], p = P[i], s = sed[i];
+      var fT = Math.pow(PAR.theta, t - 20);
+      // Light: Beer-Lambert, averaged over the water column. Turbidity and
+      // the algae themselves shade the water.
+      var ext = 0.35 + 0.04 * p + 1.2 * a, kh = ext * (h > 0.3 ? h : 0.3);
+      var fL = I0 * (1 - Math.exp(-kh)) / kh;
+      var mu = PAR.muMax * fT * fL * n / (n + PAR.ks);
+      var grow = mu * a * dt; if (grow > 0.9 * n) grow = 0.9 * n;
+      var resp = PAR.resp * fT * a * dt;
+      var die = (PAR.death + PAR.crowd * a) * a * dt;
+      var dec = PAR.decay * fT * d * dt;
+      var sink = PAR.settle / v * d * dt; if (sink > 0.5 * d) sink = 0.5 * d;
+      var sedMin = PAR.sedDecay * fT * s * dt;                 // mass per cell
+      var release = o < 2 ? PAR.sedRelease * fT * s * dt * (2 - o) / 2 : 0;
+      var bury = PAR.burial * s * dt;
+      var lost = PAR.denit * fT * n * dt; burialSum += lost * v;      // leaves the system, counted with burial in the ledger
+      var bg = PAR.bgN * dt; Mb[i] += bg; L.added += bg * v;     // background nutrient supply, tagged as natural
+      n += bg - lost - grow + resp + dec + (sedMin + release) / v;
+      a += grow - resp - die;
+      d += die - dec - sink;
+      s += sink * v - sedMin - release - bury;
+      burialSum += bury;
+      // Oxygen budget for this step.
+      var made = o2 * grow;
+      var used = o2 * (resp + dec + sedMin / v) + PAR.sod * fT / v * dt;
+      var rear = piston / (h > 0.5 ? h : 0.5) * (oxygenSaturation(t) - o) * dt;
+      var aerated = aer[i] * dt;
+      o += made - used + rear + aerated; if (o < 0) o = 0;
+      // Running oxygen budget (per day), read by the Explain panel.
+      bPhoto[i] += (made / dt - bPhoto[i]) * EMA;
+      bResp[i] += (o2 * resp / dt - bResp[i]) * EMA;
+      bDecay[i] += (o2 * dec / dt - bDecay[i]) * EMA;
+      bSed[i] += ((o2 * sedMin / v + PAR.sod * fT / v * dt) / dt - bSed[i]) * EMA;
+      bRear[i] += (rear / dt - bRear[i]) * EMA;
+      bAer[i] += (aer[i] - bAer[i]) * EMA;
+      // Origin tags: nutrients released by the bed are tagged "lake bed"; then
+      // the tags are rescaled so they always add up to the cell's nutrient pool.
+      var ms = Ms[i], mr = Mr[i], mi = Mi[i], mb = Mb[i], md = Md[i] + (sedMin + release) / v;
+      var tagSum = ms + mr + mi + mb + md, pool = n + a + d;
+      if (tagSum > 1e-12) { var sc = pool / tagSum; Ms[i] = ms * sc; Mr[i] = mr * sc; Mi[i] = mi * sc; Mb[i] = mb * sc; Md[i] = md * sc; }
+      else { Mb[i] = pool; }
+      // Temperature follows the air; shallow water responds faster.
+      t += (tAir - t) * PAR.heatRate / (h > 0.6 ? h : 0.6) * dt;
+      // Turbidity settles back toward background; wind stirs the shallows.
+      p += (-PAR.pSettle / (h > 0.5 ? h : 0.5) * (p - PAR.pBackground) + 0.15 * w.wind * w.wind / (h > 0.5 ? h : 0.5)) * dt;
+      Nn[i] = n; A[i] = a; D[i] = d; O[i] = o; T[i] = t; P[i] = p; sed[i] = s;
+      sO += o; if (o < minO) minO = o; sChl += a; if (a > maxA) maxA = a; sT += t; sP += p; sN += n;
+    }
+    L.burial += burialSum;
+    var st = sim.stats, inv = wc ? 1 / wc : 0;
+    st.meanO = sO * inv; st.minO = wc ? minO : 0; st.meanChl = sChl * inv * CHL; st.maxChl = maxA * CHL;
+    st.meanT = sT * inv; st.meanP = sP * inv; st.meanN = sN * inv;
+  }
+
+  function computeStats(sim) {         // lake-wide averages, outside a step
+    var st = sim.stats, wc = sim.wetCount, sO = 0, minO = 1e9, sA = 0, maxA = 0, sT = 0, sP = 0, sN = 0;
+    for (var k = 0; k < wc; k++) {
+      var i = sim.wetList[k];
+      sO += sim.O[i]; if (sim.O[i] < minO) minO = sim.O[i]; sA += sim.A[i]; if (sim.A[i] > maxA) maxA = sim.A[i];
+      sT += sim.T[i]; sP += sim.P[i]; sN += sim.N[i];
+    }
+    var inv = wc ? 1 / wc : 0;
+    st.meanO = sO * inv; st.minO = wc ? minO : 0; st.meanChl = sA * inv * CHL; st.maxChl = maxA * CHL;
+    st.meanT = sT * inv; st.meanP = sP * inv; st.meanN = sN * inv;
+  }
+
+  // 5e. Fish. Each fish is an agent: it schools with its neighbours
+  // (separation, alignment, cohesion, found through a spatial hash), swims up
+  // the oxygen gradient when the water gets poor, and keeps off the shallows.
+  // Stress builds while oxygen is below 3 mg/L (about 3 sim-hours at 1.5 mg/L
+  // is fatal) and eases once it is back above 4. Dead fish float for a day
+  // and their bodies add detritus. Healthy fish slowly breed back.
+  var FISH_MAX = 600, FISH_START = 300, FISH_K = 300, FISH_NUTRIENT = 0.05;
+  var HB = 4, HBW = Math.ceil(W / HB), HBH = Math.ceil(H / HB);
+  function createFish(sim) {
+    var M = FISH_MAX, f = {
+      x: new Float32Array(M), y: new Float32Array(M), vx: new Float32Array(M), vy: new Float32Array(M),
+      px: new Float32Array(M), py: new Float32Array(M),          // position before this step (for smooth drawing)
+      stress: new Float32Array(M), age: new Float32Array(M), size: new Float32Array(M),
+      state: new Uint8Array(M),                                  // 0 empty slot, 1 alive, 2 dead and floating
+      intent: new Uint8Array(M),                                 // 0 schooling, 1 fleeing low oxygen, 2 feeding, 3 avoiding the shore
+      head: new Int32Array(HBW * HBH), next: new Int32Array(M),
+      alive: 0, deaths: 0, births: 0, birthAcc: 0, lastDeath: null
+    };
+    for (var tries = 0; tries < 40 && f.alive < FISH_START; tries++) {
+      var c = randomDeepCell(sim, 2); if (c < 0) break;
+      var cx = c % W + 0.5, cy = ((c / W) | 0) + 0.5;
+      for (var k = 0; k < 30 && f.alive < FISH_START; k++) spawnFish(sim, f, cx + (rand(sim) - 0.5) * 5, cy + (rand(sim) - 0.5) * 5);
+    }
+    return f;
+  }
+  function randomDeepCell(sim, minDepth) {
+    if (!sim.wetCount) return -1;
+    for (var t = 0; t < 200; t++) {
+      var i = sim.wetList[(rand(sim) * sim.wetCount) | 0];
+      if (sim.depth[i] >= minDepth) return i;
+    }
+    return sim.wetList[(rand(sim) * sim.wetCount) | 0];
+  }
+  function spawnFish(sim, f, x, y) {
+    if (!(x >= 0 && y >= 0 && x < W && y < H) || !sim.wet[(y | 0) * W + (x | 0)]) return -1;
+    var slot = -1, oldest = -1, k;
+    for (k = 0; k < FISH_MAX; k++) {
+      if (f.state[k] === 0) { slot = k; break; }
+      if (f.state[k] === 2 && (oldest < 0 || f.age[k] > f.age[oldest])) oldest = k;
+    }
+    if (slot < 0) slot = oldest;
+    if (slot < 0) return -1;
+    var ang = rand(sim) * 6.2832;
+    f.x[slot] = f.px[slot] = x; f.y[slot] = f.py[slot] = y;
+    f.vx[slot] = Math.cos(ang) * 0.06; f.vy[slot] = Math.sin(ang) * 0.06;
+    f.stress[slot] = 0; f.age[slot] = 0; f.size[slot] = 1.1 + rand(sim) * 0.6; f.state[slot] = 1;
+    f.alive++;
+    return slot;
+  }
+  function killFish(sim, f, k) {
+    f.state[k] = 2; f.age[k] = 0; f.alive--; f.deaths++;
+    var ci = (f.y[k] | 0) * W + (f.x[k] | 0);
+    if (!sim.wet[ci]) ci = nearestWetCell(sim, ci, 6);
+    if (ci >= 0) { sim.D[ci] += FISH_NUTRIENT / sim.vol[ci]; sim.ledger.carcass += FISH_NUTRIENT; }
+    f.lastDeath = { t: sim.t, x: f.x[k], y: f.y[k] };
+  }
+  // After the shoreline moves, fish left on dry land die (stranded).
+  function strandFish(sim) {
+    var f = sim.fish; if (!f) return;
+    for (var k = 0; k < FISH_MAX; k++) {
+      if (f.state[k] === 1 && !sim.wet[(f.y[k] | 0) * W + (f.x[k] | 0)]) killFish(sim, f, k);
+    }
+  }
+  function oxygenAt(sim, x, y, fallback) {
+    var xi = x | 0, yi = y | 0;
+    if (xi < 0 || yi < 0 || xi >= W || yi >= H) return fallback;
+    var i = yi * W + xi;
+    return sim.wet[i] ? sim.O[i] : fallback;
+  }
+  function algaeAt(sim, x, y) {
+    var xi = x | 0, yi = y | 0;
+    return (xi < 0 || yi < 0 || xi >= W || yi >= H) ? 0 : sim.A[yi * W + xi];
+  }
+  function depthAt(sim, x, y) {
+    var xi = x | 0, yi = y | 0;
+    return (xi < 0 || yi < 0 || xi >= W || yi >= H) ? 0 : sim.depth[yi * W + xi];
+  }
+
+  function updateFish(sim) {
+    var f = sim.fish, head = f.head, next = f.next, X = f.x, Y = f.y, VX = f.vx, VY = f.vy, k, j, b;
+    head.fill(-1);
+    for (k = 0; k < FISH_MAX; k++) {
+      if (f.state[k] !== 1) continue;
+      b = Math.min(HBH - 1, (Y[k] / HB) | 0) * HBW + Math.min(HBW - 1, (X[k] / HB) | 0);
+      next[k] = head[b]; head[b] = k;
+    }
+    var w = sim.weather, goodParents = 0;
+    for (k = 0; k < FISH_MAX; k++) {
+      var st = f.state[k];
+      if (st === 2) {                                   // floating carcass drifts with the wind
+        f.px[k] = X[k]; f.py[k] = Y[k]; f.age[k]++;
+        var dx0 = Math.cos(w.windDir) * w.wind * 0.004, dy0 = Math.sin(w.windDir) * w.wind * 0.004;
+        if (sim.wet[((Y[k] + dy0) | 0) * W + ((X[k] + dx0) | 0)]) { X[k] += dx0; Y[k] += dy0; }
+        if (f.age[k] > STEPS_PER_DAY) f.state[k] = 0;
+        continue;
+      }
+      if (st !== 1) continue;
+      var x = X[k], y = Y[k], vx = VX[k], vy = VY[k];
+      f.px[k] = x; f.py[k] = y; f.age[k]++;
+      // Schooling: look at neighbours in this and the 8 surrounding buckets.
+      var bx = (x / HB) | 0, by = (y / HB) | 0, cnt = 0, ax = 0, ay = 0, cx = 0, cy = 0, sx = 0, sy = 0;
+      for (var gy = by - 1; gy <= by + 1; gy++) {
+        if (gy < 0 || gy >= HBH) continue;
+        for (var gx = bx - 1; gx <= bx + 1; gx++) {
+          if (gx < 0 || gx >= HBW) continue;
+          for (j = head[gy * HBW + gx]; j >= 0; j = next[j]) {
+            if (j === k) continue;
+            var ddx = X[j] - x, ddy = Y[j] - y, d2 = ddx * ddx + ddy * ddy;
+            if (d2 > 12) continue;
+            cnt++; ax += VX[j]; ay += VY[j]; cx += ddx; cy += ddy;
+            if (d2 < 2.6) { sx -= ddx / (d2 + 0.1); sy -= ddy / (d2 + 0.1); }
+          }
+        }
+      }
+      var steerX = 0, steerY = 0, intent = 0;
+      if (cnt) {
+        steerX += (ax / cnt - vx) * 0.06 + cx / cnt * 0.003 + sx * 0.012;
+        steerY += (ay / cnt - vy) * 0.06 + cy / cnt * 0.003 + sy * 0.012;
+      }
+      // Oxygen: swim up the gradient, harder the worse the water is here.
+      var o = oxygenAt(sim, x, y, 0);
+      var gox = oxygenAt(sim, x + 2, y, o) - oxygenAt(sim, x - 2, y, o);
+      var goy = oxygenAt(sim, x, y + 2, o) - oxygenAt(sim, x, y - 2, o);
+      var gl = Math.sqrt(gox * gox + goy * goy);
+      if (gl > 1e-4) {
+        var wO = (o < 4 ? 0.01 * (4 - o) : 0.001) * Math.min(1, gl);
+        steerX += gox / gl * wO; steerY += goy / gl * wO;
+        if (o < 4) intent = 1;
+      }
+      // Food: in good water, fish drift toward plankton-rich water to feed.
+      // This is why fish get caught when a bloom's oxygen crashes at night.
+      if (o > 4.5) {
+        var gax = algaeAt(sim, x + 2, y) - algaeAt(sim, x - 2, y), gay = algaeAt(sim, x, y + 2) - algaeAt(sim, x, y - 2);
+        var ga = Math.sqrt(gax * gax + gay * gay);
+        if (ga > 1e-3) { var wA = 0.012 * Math.min(1, ga * 20); steerX += gax / ga * wA; steerY += gay / ga * wA; if (wA > 0.004) intent = 2; }
+      }
+      // Shore: fish prefer open water. A gentle pull toward deeper water in
+      // the shallows, and a hard turn if the water ahead is too shallow.
+      var here = depthAt(sim, x, y);
+      if (here < 2.5 || depthAt(sim, x + vx * 8, y + vy * 8) < 0.8) {
+        var dgx = depthAt(sim, x + 1.5, y) - depthAt(sim, x - 1.5, y), dgy = depthAt(sim, x, y + 1.5) - depthAt(sim, x, y - 1.5);
+        var dl = Math.sqrt(dgx * dgx + dgy * dgy) + 1e-6;
+        if (depthAt(sim, x + vx * 8, y + vy * 8) < 0.8) { steerX += dgx / dl * 0.03 - vx * 0.05; steerY += dgy / dl * 0.03 - vy * 0.05; if (intent !== 1) intent = 3; }
+        else { steerX += dgx / dl * 0.005; steerY += dgy / dl * 0.005; }
+      }
+      steerX += (rand(sim) - 0.5) * 0.012; steerY += (rand(sim) - 0.5) * 0.012;
+      vx += steerX; vy += steerY;
+      var sp = Math.sqrt(vx * vx + vy * vy), vmax = 0.11 + 0.08 * f.stress[k];
+      if (sp > vmax) { vx *= vmax / sp; vy *= vmax / sp; } else if (sp < 0.03) { vx *= 0.03 / (sp + 1e-6); vy *= 0.03 / (sp + 1e-6); }
+      var nx = x + vx, ny = y + vy;
+      if (nx >= 0 && ny >= 0 && nx < W && ny < H && sim.wet[(ny | 0) * W + (nx | 0)]) { X[k] = nx; Y[k] = ny; }
+      else { vx = -vx * 0.5; vy = -vy * 0.5; }
+      VX[k] = vx; VY[k] = vy; f.intent[k] = intent;
+      // Stress and death.
+      var t = sim.T[(Y[k] | 0) * W + (X[k] | 0)];
+      if (o < 3) f.stress[k] += (3 - o) / 45;
+      else if (o > 4) f.stress[k] = Math.max(0, f.stress[k] - 1 / 60);
+      if (t > 34) f.stress[k] += (t - 34) / 200;
+      var pol = sim.P[(Y[k] | 0) * W + (X[k] | 0)];               // idol paint and debris are toxic
+      if (pol > 60) f.stress[k] += (pol - 60) / 3000;
+      if (f.stress[k] >= 1) { killFish(sim, f, k); continue; }
+      if (o > 5 && t < 33 && f.stress[k] < 0.1) goodParents++;
+    }
+    // Breeding: logistic growth toward the lake's carrying capacity, only
+    // from fish that are in good water.
+    if (f.alive < FISH_K && goodParents > 0) {
+      f.birthAcc += 0.07 / STEPS_PER_DAY * goodParents * (1 - f.alive / FISH_K);
+      while (f.birthAcc >= 1) {
+        f.birthAcc -= 1;
+        var start = (rand(sim) * FISH_MAX) | 0;
+        for (j = 0; j < FISH_MAX; j++) {
+          var p = (start + j) % FISH_MAX;
+          if (f.state[p] === 1 && f.stress[p] < 0.1 && oxygenAt(sim, X[p], Y[p], 0) > 5) {
+            if (spawnFish(sim, f, X[p] + (rand(sim) - 0.5), Y[p] + (rand(sim) - 0.5)) >= 0) f.births++;
+            break;
+          }
+        }
+      }
+    } else f.birthAcc = 0;
+  }
+
+  // 5f. The step itself.
+  function step(sim) {
+    processEvents(sim);
+    updateWeather(sim);
+    updateFlow(sim);
+    transportAll(sim);
+    react(sim);
+    updateFish(sim);
+    sim.t++;
+    if (sim.t % 10 === 0) { detect(sim); recordHistory(sim); }   // every sim-hour
+    if (sim.t % SNAP_EVERY === 0) takeSnapshot(sim);             // every 3 sim-hours, for Rewind
+  }
+
+  // ---------- 6. Clock and sun --------------------------------------------
+  var MONTHS = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
+  var MONTH_DAYS = [31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
+  function pad2(n) { return (n < 10 ? '0' : '') + n; }
+  // t is in steps and may be fractional (the renderer interpolates).
+  function clock(t) {
+    var minutes = START_HOUR * 60 + Math.floor(t) * STEP_MIN;
+    var day = Math.floor(minutes / 1440), m = minutes - day * 1440;
+    var month = 8, dom = day, year = 2026;                   // run starts 1 Sep 2026
+    while (dom >= MONTH_DAYS[month]) { dom -= MONTH_DAYS[month]; month++; if (month > 11) { month = 0; year++; } }
+    return {
+      day: day, hour: (m / 60) | 0, minute: m % 60,
+      time: pad2((m / 60) | 0) + ':' + pad2(m % 60),
+      date: 'Day ' + (day + 1) + ' · ' + (dom + 1) + ' ' + MONTHS[month] + ' ' + year
+    };
+  }
+  // Sun position: rises at 06:00, highest at noon, sets at 18:00.
+  function sun(t) {
+    var hour = (START_HOUR + t * STEP_MIN / 60) % 24;
+    var elev = Math.sin((hour - 6) / 24 * 2 * Math.PI);      // -1 (midnight) .. 1 (noon)
+    var x = Math.max(0, Math.min(1, (elev + 0.2) / 0.34));
+    return { hour: hour, elev: elev, light: x * x * (3 - 2 * x) };   // light: 0 night .. 1 day
+  }
+
+  // ---------- 7. Events and the lake's diary -------------------------------
+  // Every event, intervention and detected consequence is written to a log.
+  // Each consequence lists the entries that caused it, so the app can tell
+  // the whole story: "this bloom grew on nutrients from that pipe, sped up
+  // by that heat wave".
+  function createEvents() {
+    return {
+      pipes: [],                        // sewage pipes: {id, x, y, treated (0..1), entry}
+      rainUntil: -1, heatUntil: -1, droughtUntil: -1, immersionUntil: -1,
+      rainEntry: null, heatEntry: null, droughtEntry: null, immersionEntry: null,
+      banImmersion: false,
+      budget: 100, aerators: [], wetlands: [], crewAt: -1,   // Fix It: credits left and what has been built
+      wetland: new Uint8Array(N),       // 1 on shore cells protected by a wetland buffer
+      log: [], nextId: 1, deathsLogged: 0, lowSince: -1,
+      scoreT: [], scoreV: []            // score timeline, one point per sim-hour
+    };
+  }
+  function logEntry(sim, kind, type, label, x, y, causes, detail) {
+    var e = sim.ev, entry = { id: e.nextId++, t: sim.t, kind: kind, type: type, label: label,
+      x: x, y: y, causes: causes || [], detail: detail || '', score: Math.round(sim.scoreSmooth || 0) };
+    e.log.push(entry);
+    if (e.log.length > 400) e.log.shift();
+    return entry;
+  }
+  function findEntry(sim, id) {
+    var log = sim.ev.log;
+    for (var k = log.length - 1; k >= 0; k--) if (log[k].id === id) return log[k];
+    return null;
+  }
+
+  // Nearest wet cell that touches land, within a radius (for pipes and clicks on the shore).
+  function nearestShoreCell(sim, x, y, radius) {
+    var best = -1, bd = 1e9;
+    for (var k = 0; k < sim.shoreCount; k++) {
+      var i = sim.shore[k], dx = i % W + 0.5 - x, dy = ((i / W) | 0) + 0.5 - y, d2 = dx * dx + dy * dy;
+      if (d2 < bd) { bd = d2; best = i; }
+    }
+    return bd <= radius * radius ? best : -1;
+  }
+
+  // The five events a judge can trigger. Returns {ok, msg, entry}.
+  function triggerEvent(sim, type, x, y) {
+    var e = sim.ev, t = sim.t, g = sim.world.ghat, entry;
+    if (!sim.wetCount) return { ok: false, msg: 'The lake has dried up.' };
+    if (type === 'rain') {
+      e.rainUntil = Math.max(e.rainUntil, t) + STEPS_PER_DAY;
+      entry = e.rainEntry = logEntry(sim, 'event', 'rain', 'Heavy rain', -1, -1, [],
+        'Runoff washes fertiliser, soil and waste off the shore for a day.');
+    } else if (type === 'sewage') {
+      if (e.pipes.length >= 4) return { ok: false, msg: 'Four pipes is the limit. Treat one instead.' };
+      var c = nearestShoreCell(sim, x, y, 10);
+      if (c < 0) return { ok: false, msg: 'Tap closer to the shore to place the pipe.' };
+      var px = c % W + 0.5, py = ((c / W) | 0) + 0.5;
+      for (var k = 0; k < e.pipes.length; k++) if (Math.hypot(e.pipes[k].x - px, e.pipes[k].y - py) < 4) return { ok: false, msg: 'There is already a pipe here.' };
+      entry = logEntry(sim, 'event', 'sewage', 'Sewage pipe opened ' + placeName(sim, px, py), px, py, [],
+        'Untreated sewage pours in: dissolved nutrients plus organic solids.');
+      e.pipes.push({ id: entry.id, x: px, y: py, treated: 0, load: 1, entry: entry });
+    } else if (type === 'immersion') {
+      if (e.banImmersion) return { ok: false, msg: 'Immersion is banned. Idols go to the artificial tank instead.' };
+      e.immersionUntil = Math.max(e.immersionUntil, t) + STEPS_PER_DAY / 2;
+      entry = e.immersionEntry = logEntry(sim, 'event', 'immersion', 'Idol immersion at the ghat', g.x, g.y, [],
+        'Clay, paint, cloth and flowers cloud the water; the organic part rots slowly.');
+    } else if (type === 'heat') {
+      e.heatUntil = Math.max(e.heatUntil, t) + 4 * STEPS_PER_DAY;
+      entry = e.heatEntry = logEntry(sim, 'event', 'heat', 'Heat wave', -1, -1, [],
+        'Air 6 °C hotter for 4 days: algae grow faster and warm water holds less oxygen.');
+    } else if (type === 'drought') {
+      e.droughtUntil = Math.max(e.droughtUntil, t) + 5 * STEPS_PER_DAY;
+      entry = e.droughtEntry = logEntry(sim, 'event', 'drought', 'Drought', -1, -1, [],
+        'No rain, weak river: the lake evaporates and everything in it concentrates.');
+    } else return { ok: false, msg: 'Unknown event.' };
+    return { ok: true, msg: entry.label, entry: entry };
+  }
+
+  // ---------- 7b. Fix It: interventions with a budget ------------------------
+  // Each returns {ok, msg, entry}. A refused action costs nothing.
+  function nearestOf(list, x, y, r) {
+    var best = null, bd = r;
+    for (var k = 0; k < list.length; k++) { var d = Math.hypot(list[k].x - x, list[k].y - y); if (d < bd) { bd = d; best = list[k]; } }
+    return best;
+  }
+  function buildAction(sim, type, x, y) {
+    var e = sim.ev, cost = COST[type], t = sim.t, g = sim.world.ghat, k, i, entry;
+    if (cost === undefined) return { ok: false, msg: 'Unknown tool.' };
+    if (!sim.wetCount) return { ok: false, msg: 'The lake has dried up.' };
+    if (e.budget < cost) return { ok: false, msg: 'Not enough budget: ' + COST_NAME[type].toLowerCase() + ' costs ' + cost + ' credits and only ' + e.budget + ' are left.' };
+    if (type === 'aerator') {
+      var c = Math.floor(y) * W + Math.floor(x);
+      if (!(x >= 0 && y >= 0 && x < W && y < H) || !sim.wet[c]) return { ok: false, msg: 'Aerators float on the water. Tap the lake.' };
+      if (e.aerators.length >= 8) return { ok: false, msg: 'Eight aerators is the limit.' };
+      var ax = Math.floor(x) + 0.5, ay = Math.floor(y) + 0.5;
+      if (nearestOf(e.aerators, ax, ay, 3)) return { ok: false, msg: 'There is already an aerator close by.' };
+      entry = logEntry(sim, 'action', 'aerator', 'Aerator installed ' + placeName(sim, ax, ay), ax, ay, [], 'Bubbles oxygen into about 6 cells of water.');
+      e.aerators.push({ id: entry.id, x: ax, y: ay, entry: entry });
+      var sg = PAR.aerSigma, R = Math.ceil(sg * 3);
+      for (var yy = Math.max(0, Math.floor(ay) - R); yy <= Math.min(H - 1, Math.floor(ay) + R); yy++)
+        for (var xx = Math.max(0, Math.floor(ax) - R); xx <= Math.min(W - 1, Math.floor(ax) + R); xx++) {
+          var d2 = (xx + 0.5 - ax) * (xx + 0.5 - ax) + (yy + 0.5 - ay) * (yy + 0.5 - ay);
+          if (d2 < R * R) sim.aer[yy * W + xx] += PAR.aerPeak * Math.exp(-d2 / (2 * sg * sg));
+        }
+    } else if (type === 'plant') {
+      var pipe = null, bd = 14;
+      for (k = 0; k < e.pipes.length; k++) { var dd = Math.hypot(e.pipes[k].x - x, e.pipes[k].y - y); if (dd < bd && e.pipes[k].treated === 0) { bd = dd; pipe = e.pipes[k]; } }
+      if (!pipe) return { ok: false, msg: e.pipes.length ? 'Tap closer to an untreated sewage pipe.' : 'There is no sewage pipe to treat.' };
+      pipe.treated = 0.9; pipe.treatedAt = t;
+      entry = logEntry(sim, 'action', 'plant', 'Treatment plant built at the sewage pipe ' + placeName(sim, pipe.x, pipe.y), pipe.x, pipe.y, [pipe.id], 'Cuts the pipe\'s nutrient load by 90%.');
+      pipe.plantEntry = entry;
+    } else if (type === 'wetland') {
+      var sc = nearestShoreCell(sim, x, y, 9);
+      if (sc < 0) return { ok: false, msg: 'Wetlands grow on the shore. Tap closer to the water\'s edge.' };
+      var wx = sc % W + 0.5, wy = ((sc / W) | 0) + 0.5, fresh = 0;
+      for (k = 0; k < sim.shoreCount; k++) {
+        i = sim.shore[k];
+        if (Math.hypot(i % W + 0.5 - wx, ((i / W) | 0) + 0.5 - wy) <= 9 && !e.wetland[i]) { e.wetland[i] = 1; fresh++; }
+      }
+      if (fresh < 3) return { ok: false, msg: 'This stretch of shore is already protected.' };
+      entry = logEntry(sim, 'action', 'wetland', 'Wetland buffer planted ' + placeName(sim, wx, wy), wx, wy, [], 'Reeds and marsh filter 70% of the runoff along this shore.');
+      e.wetlands.push({ x: wx, y: wy, r: 9, id: entry.id });
+    } else if (type === 'ban') {
+      if (e.banImmersion) return { ok: false, msg: 'Immersion is already banned.' };
+      e.banImmersion = true; e.immersionUntil = -1;
+      entry = logEntry(sim, 'action', 'ban', 'Idol immersion banned in the lake', g.x, g.y, e.immersionEntry ? [e.immersionEntry.id] : [], 'Idols go to an artificial tank instead.');
+    } else if (type === 'crew') {
+      if (e.crewAt >= 0) return { ok: false, msg: 'The clean-up crew has already been sent (one-off).' };
+      e.crewAt = t; var L = sim.ledger, removed = 0;
+      for (k = 0; k < sim.wetCount; k++) {
+        i = sim.wetList[k];
+        if (Math.hypot(i % W + 0.5 - g.x, ((i / W) | 0) + 0.5 - g.y) > 10) continue;
+        var dp = sim.P[i] - PAR.pBackground; if (dp > 0) sim.P[i] -= 0.85 * dp;
+        var dm = 0.8 * sim.D[i] * sim.vol[i]; sim.D[i] *= 0.2; removed += dm;
+        var ds = 0.5 * sim.sed[i]; sim.sed[i] -= ds; removed += ds;
+      }
+      L.removed += removed;
+      entry = logEntry(sim, 'action', 'crew', 'Clean-up crew sent to the ghat', g.x, g.y, e.immersionEntry ? [e.immersionEntry.id] : [], 'Removes sludge, debris and silt near the ghat.');
+    }
+    e.budget -= cost;
+    entry.detail += ' Cost ' + cost + ' credits, ' + e.budget + ' left.';
+    return { ok: true, msg: entry.label, entry: entry };
+  }
+
+  // Runs at the start of every step: pipes leak, rain washes in, levels move.
+  function processEvents(sim) {
+    var e = sim.ev, w = sim.weather, t = sim.t, k, m;
+    for (k = 0; k < e.pipes.length; k++) {
+      var p = e.pipes[k]; m = PAR.sewageLoad * p.load * (1 - p.treated);
+      if (m > 0) {
+        addNutrient(sim, p.x, p.y, 1.6, m * PAR.sewageDissolved, 'N', 0);
+        addNutrient(sim, p.x, p.y, 1.6, m * (1 - PAR.sewageDissolved), 'D', 0);
+      }
+    }
+    var raining = t < e.rainUntil, hot = t < e.heatUntil, dry = t < e.droughtUntil;
+    w.rain = raining ? 1 : 0;
+    w.cloudTarget = raining ? 0.95 : dry ? 0.05 : 0.25;
+    w.windBoost = raining ? 1.8 : 0;
+    w.riverFactor = raining ? 2.5 : dry ? 0.3 : 1;
+    w.heat += (((hot ? PAR.heatWave : 0) + (dry ? 1.5 : 0)) - w.heat) * 0.02;   // ramps over about half a day
+    if (raining) runoff(sim);
+    if (t < e.immersionUntil) {
+      var g = sim.world.ghat, r2 = 9;
+      addNutrient(sim, g.x + 0.5, g.y + 1.5, 3, PAR.immersionLoad * 0.5, 'N', 2);   // offerings and flowers dissolve
+      addNutrient(sim, g.x + 0.5, g.y + 1.5, 3, PAR.immersionLoad * 0.5, 'D', 2);   // clay, cloth and wood rot
+      for (var y = g.y - 3; y <= g.y + 5; y++) for (var x = g.x - 4; x <= g.x + 4; x++) {
+        var i = y * W + x;
+        if (y > 0 && y < H && sim.wet[i] && (x - g.x) * (x - g.x) + (y - g.y - 1.5) * (y - g.y - 1.5) <= r2 * 1.5) sim.P[i] += 2.2;
+      }
+    }
+    // Water level: rain fills the lake, drought evaporates it, the spillway drains any surplus.
+    var dl = 0;
+    if (raining) dl += 0.45 / STEPS_PER_DAY;
+    if (dry) dl -= 0.3 / STEPS_PER_DAY;
+    if (!raining && sim.level > 0) dl -= Math.min(sim.level, 0.15 / STEPS_PER_DAY);
+    // Level changes are applied in 2 cm increments: moving the shoreline means
+    // rebuilding the flow solution, which is too costly to do on every step.
+    sim.levelPending += dl;
+    if (Math.abs(sim.levelPending) >= 0.02) { setLevel(sim, sim.level + sim.levelPending); sim.levelPending = 0; }
+  }
+
+  // Heavy rain: runoff enters along every shore cell. Wetland buffers catch 70%.
+  function runoff(sim) {
+    var n = sim.shoreCount; if (!n) return;
+    var per = PAR.runoffLoad / n, L = sim.ledger, wl = sim.ev.wetland;
+    for (var k = 0; k < n; k++) {
+      var i = sim.shore[k], f = wl[i] ? 0.3 : 1, m = per * f, v = sim.vol[i];
+      sim.N[i] += m * 0.6 / v; sim.D[i] += m * 0.4 / v; sim.Mr[i] += m / v;
+      sim.P[i] += 0.25 * f;
+      L.added += m;
+    }
+  }
+
+  // Share of a cell's nutrients from each origin (sewage, runoff, immersion, river, bed).
+  function tagShares(sim, i) {
+    var v = [sim.Ms[i], sim.Mr[i], sim.Mi[i], sim.Mb[i], sim.Md[i]], s = v[0] + v[1] + v[2] + v[3] + v[4];
+    for (var k = 0; k < 5; k++) v[k] = s > 0 ? v[k] / s : (k === 3 ? 1 : 0);
+    return v;
+  }
+  // The log entries that explain a cell's state: the events whose nutrients
+  // are here (15% share or more), and amplifiers active within the last day.
+  function causesFor(sim, i) {
+    var e = sim.ev, sh = tagShares(sim, i), out = [], x = i % W + 0.5, y = ((i / W) | 0) + 0.5, k;
+    if (sh[0] >= 0.15 && e.pipes.length) {
+      var best = null, bd = 1e9;
+      for (k = 0; k < e.pipes.length; k++) { var d = Math.hypot(e.pipes[k].x - x, e.pipes[k].y - y); if (d < bd) { bd = d; best = e.pipes[k]; } }
+      out.push(best.id);
+    }
+    if (sh[1] >= 0.15 && e.rainEntry) out.push(e.rainEntry.id);
+    if (sh[2] >= 0.15 && e.immersionEntry) out.push(e.immersionEntry.id);
+    if (e.heatEntry && sim.t < e.heatUntil + STEPS_PER_DAY) out.push(e.heatEntry.id);
+    if (e.droughtEntry && sim.t < e.droughtUntil + STEPS_PER_DAY) out.push(e.droughtEntry.id);
+    return out;
+  }
+
+  // ---------- 8. Lake Health Score -----------------------------------------
+  // 0-100, from five things people can see and check:
+  //   oxygen (30): 6 mg/L or more is fine, 3 or less is dead water
+  //   algae (25): 20 ug/L or less is clear, 100 or more is a bloom
+  //   clarity (10): turbidity below 15 NTU is clear, above 80 is murky
+  //   fish (25): fish alive compared with the healthy population
+  //   water level (10): lake area compared with full
+  // For the first three, each cell gets a badness from 0 to 1 and the points
+  // are lost 7 times as fast as the share of bad water, so a crisis that
+  // covers a seventh of the lake already scores zero for that part.
+  function healthScore(sim) {
+    var wl = sim.wetList, wc = sim.wetCount, so = 0, sa = 0, sp = 0;
+    if (wc < 1) { sim.scoreParts = { oxygen: 0, algae: 0, clarity: 0, fish: 0, level: 0 }; return 0; }
+    for (var k = 0; k < wc; k++) {
+      var i = wl[k], o = sim.O[i], c = sim.A[i] * CHL, p = sim.P[i];
+      so += o >= 6 ? 0 : o <= 3 ? 1 : (6 - o) / 3;
+      sa += c <= 20 ? 0 : c >= 100 ? 1 : (c - 20) / 80;
+      sp += p <= 15 ? 0 : p >= 80 ? 1 : (p - 15) / 65;
+    }
+    so = wc - so; sa = wc - sa; sp = wc - sp;                  // convert badness to "goodness" sums
+    var gk = 7; so = Math.max(0, wc - gk * (wc - so)); sa = Math.max(0, wc - gk * (wc - sa)); sp = Math.max(0, wc - gk * (wc - sp));
+    var area = sim.wetCount / sim.fullWetCount, lv = Math.max(0, Math.min(1, (area - 0.6) / 0.35));
+    var parts = { oxygen: 30 * so / wc, algae: 25 * sa / wc, clarity: 10 * sp / wc,
+                  fish: 25 * Math.min(1, sim.fish.alive / FISH_START), level: 10 * lv };
+    sim.scoreParts = parts;
+    return parts.oxygen + parts.algae + parts.clarity + parts.fish + parts.level;
+  }
+
+  // Every sim-hour: update the score and look for new consequences.
+  function detect(sim) {
+    var e = sim.ev, t = sim.t, wl = sim.wetList, wc = sim.wetCount, k, i;
+    var raw = healthScore(sim);
+    sim.score = raw;
+    sim.scoreSmooth += (raw - sim.scoreSmooth) * 0.08;
+    e.scoreT.push(t); e.scoreV.push(sim.scoreSmooth);
+    if (e.scoreT.length > 24 * 30) { e.scoreT.shift(); e.scoreV.shift(); }
+
+    // Recent consequences of each type, to avoid logging the same patch twice.
+    function recent(type, within) {
+      var out = [];
+      for (var q = e.log.length - 1; q >= 0 && t - e.log[q].t <= within; q--) if (e.log[q].type === type) out.push(e.log[q]);
+      return out;
+    }
+    function farFrom(list, i0, dist) {
+      var x = i0 % W, y = (i0 / W) | 0;
+      for (var q = 0; q < list.length; q++) if (Math.hypot(list[q].x - x, list[q].y - y) < dist) return false;
+      return true;
+    }
+    function nearest(list, i0, dist) {
+      var x = i0 % W, y = (i0 / W) | 0, best = null, bd = dist;
+      for (var q = 0; q < list.length; q++) { var d = Math.hypot(list[q].x - x, list[q].y - y); if (d < bd) { bd = d; best = list[q]; } }
+      return best;
+    }
+
+    // 1. Algae bloom: chlorophyll above 100 ug/L somewhere new.
+    var blooms = recent('bloom', 3 * STEPS_PER_DAY), best = -1, bestA = 100 / CHL;
+    for (k = 0; k < wc; k++) { i = wl[k]; if (sim.A[i] > bestA) { bestA = sim.A[i]; best = i; } }
+    if (best >= 0 && farFrom(blooms, best, 20)) {
+      var bx = best % W + 0.5, by = ((best / W) | 0) + 0.5;
+      logEntry(sim, 'effect', 'bloom', 'Algae bloom ' + placeName(sim, bx, by), bx, by, causesFor(sim, best),
+        Math.round(sim.A[best] * CHL) + ' µg/L chlorophyll; the water turns green.');
+    }
+    // 2. Oxygen crash: below 3 mg/L somewhere new.
+    var crashes = recent('hypoxia', STEPS_PER_DAY), worst = -1, worstO = 3;
+    for (k = 0; k < wc; k++) { i = wl[k]; if (sim.O[i] < worstO) { worstO = sim.O[i]; worst = i; } }
+    if (worst >= 0 && farFrom(crashes, worst, 20)) {
+      var hx = worst % W + 0.5, hy = ((worst / W) | 0) + 0.5, causes = [];
+      var bl = nearest(recent('bloom', 5 * STEPS_PER_DAY), worst, 30);
+      if (bl) causes.push(bl.id);
+      var more = causesFor(sim, worst);
+      for (k = 0; k < more.length; k++) if (causes.indexOf(more[k]) < 0) causes.push(more[k]);
+      logEntry(sim, 'effect', 'hypoxia', 'Oxygen crash ' + placeName(sim, hx, hy), hx, hy, causes,
+        'Oxygen fell to ' + sim.O[worst].toFixed(1) + ' mg/L, too little for fish.');
+    }
+    // 3. Fish kill: three or more new deaths.
+    var f = sim.fish, newDead = f.deaths - e.deathsLogged;
+    if (newDead >= 3 && f.lastDeath) {
+      var dx = f.lastDeath.x, dy = f.lastDeath.y, di = (dy | 0) * W + (dx | 0), fc = [];
+      var hy2 = nearest(recent('hypoxia', 2 * STEPS_PER_DAY), di, 35);
+      if (hy2) fc.push(hy2.id);
+      else if (e.immersionEntry && sim.t < e.immersionUntil + STEPS_PER_DAY) fc.push(e.immersionEntry.id);
+      else if (e.heatEntry && sim.t < e.heatUntil + STEPS_PER_DAY) fc.push(e.heatEntry.id);
+      logEntry(sim, 'effect', 'fishkill', newDead + ' fish died ' + placeName(sim, dx, dy), dx, dy, fc,
+        f.alive + ' fish still alive.');
+      e.deathsLogged = f.deaths;
+    }
+    // 4. Recovery: the score climbs back above 75 after falling below 60.
+    if (sim.scoreSmooth < 60 && e.lowSince < 0) e.lowSince = t;
+    if (e.lowSince >= 0 && sim.scoreSmooth >= 75) {
+      var helped = [];
+      for (k = 0; k < e.log.length; k++) if (e.log[k].kind === 'action' && e.log[k].t >= e.lowSince - STEPS_PER_DAY) helped.push(e.log[k].id);
+      logEntry(sim, 'effect', 'recovery', 'Lake recovering', -1, -1, helped, 'Health score back above 75.');
+      e.lowSince = -1;
+    }
+  }
+
+  // ---------- 9. History for the live graph --------------------------------
+  // One frame per sim-hour for the last 5 days, every cell, packed into bytes:
+  // oxygen in 0.08 mg/L steps, chlorophyll in 2.5 ug/L steps, temperature in
+  // 0.12 C steps, plus fish counts on the 4x4-cell hash grid. About 6 MB.
+  var HIST = 120, FB = HBW * HBH;
+  function createHistory() {
+    return { O: new Uint8Array(HIST * N), A: new Uint8Array(HIST * N), T: new Uint8Array(HIST * N),
+             F: new Uint8Array(HIST * FB), t: new Int32Array(HIST).fill(-1), head: 0, count: 0 };
+  }
+  function recordHistory(sim) {
+    var h = sim.hist, base = h.head * N, fb = h.head * FB, i, v;
+    for (i = 0; i < N; i++) {
+      if (!sim.wet[i]) { h.O[base + i] = 0; h.A[base + i] = 0; h.T[base + i] = 0; continue; }
+      v = sim.O[i] * 12.75 + 0.5; h.O[base + i] = v > 255 ? 255 : v;
+      v = sim.A[i] * CHL / 2.5 + 0.5; h.A[base + i] = v > 255 ? 255 : v;
+      v = (sim.T[i] - 15) * 8.5 + 0.5; h.T[base + i] = v < 0 ? 0 : v > 255 ? 255 : v;
+    }
+    for (i = 0; i < FB; i++) h.F[fb + i] = 0;
+    var f = sim.fish;
+    for (var k = 0; k < FISH_MAX; k++) {
+      if (f.state[k] !== 1) continue;
+      var b = fb + Math.min(HBH - 1, (f.y[k] / HB) | 0) * HBW + Math.min(HBW - 1, (f.x[k] / HB) | 0);
+      if (h.F[b] < 255) h.F[b]++;
+    }
+    h.t[h.head] = sim.t; h.head = (h.head + 1) % HIST; if (h.count < HIST) h.count++;
+  }
+  // Time series for one cell, oldest first: oxygen, chlorophyll, temperature, fish nearby.
+  function cellHistory(sim, i) {
+    var h = sim.hist, out = { t: [], O: [], chl: [], T: [], fish: [] };
+    var bx = Math.min(HBW - 1, ((i % W) / HB) | 0), by = Math.min(HBH - 1, (((i / W) | 0) / HB) | 0);
+    for (var k = 0; k < h.count; k++) {
+      var fr = (h.head - h.count + k + HIST) % HIST, base = fr * N, fb = fr * FB, nf = 0;
+      if (h.t[fr] < 0 || h.t[fr] > sim.t) continue;
+      for (var gy = by - 1; gy <= by + 1; gy++) for (var gx = bx - 1; gx <= bx + 1; gx++)
+        if (gx >= 0 && gy >= 0 && gx < HBW && gy < HBH) nf += h.F[fb + gy * HBW + gx];
+      out.t.push(h.t[fr]); out.O.push(h.O[base + i] / 12.75); out.chl.push(h.A[base + i] * 2.5);
+      out.T.push(h.T[base + i] ? h.T[base + i] / 8.5 + 15 : NaN); out.fish.push(nf);
+    }
+    return out;
+  }
+
+  // ---------- 10. Explanations in plain language ---------------------------
+  function placeName(sim, x, y) {
+    var w = sim.world, e = sim.ev, best = null, bd = 13, k, d;
+    function consider(name, px, py, r) { d = Math.hypot(px - x, py - y); if (d < (r || bd) && d < bd) { bd = d; best = name; } }
+    consider('near the ghat', w.ghat.x + 0.5, w.ghat.y + 0.5);
+    consider('where the river comes in', w.inflow.x, w.inflow.y);
+    consider('near the spillway', w.outlet.x, w.outlet.y);
+    for (k = 0; k < w.islands.length; k++) consider(k === 0 ? 'by the island shrine' : 'by the island', w.islands[k].x, w.islands[k].y, 9);
+    if (e) for (k = 0; k < e.pipes.length; k++) consider('by the sewage pipe', e.pipes[k].x, e.pipes[k].y, 8);
+    if (best) return best;
+    var ns = y < H * 0.4 ? 'north' : y > H * 0.6 ? 'south' : '', ew = x < W * 0.38 ? 'west' : x > W * 0.62 ? 'east' : '';
+    return ns || ew ? 'in the ' + ns + (ns && ew ? '-' : '') + ew + ' of the lake' : 'in the middle of the lake';
+  }
+  function ago(sim, t) {
+    var steps = sim.t - t, hours = Math.round(steps * STEP_MIN / 60);
+    if (hours < 1) return 'just now';
+    if (hours < 36) return hours + (hours === 1 ? ' hour ago' : ' hours ago');
+    var days = Math.round(hours / 24);
+    return days + ' days ago';
+  }
+  function fmt(v, d) { return v.toFixed(d === undefined ? 1 : d); }
+
+  // Explain one cell. Returns {title, lines, chain}: lines are sentences,
+  // chain is the list of logged events and consequences behind them.
+  function explainCell(sim, i) {
+    var x = i % W + 0.5, y = ((i / W) | 0) + 0.5, e = sim.ev, lines = [], chainIds = [];
+    var title = 'Water ' + placeName(sim, x, y);
+    if (!sim.wet[i]) {
+      var bed = sim.world.bed[i];
+      return { title: 'Shore ' + placeName(sim, x, y),
+               lines: [bed > 0 ? 'This is lake bed exposed by the low water. It will flood again when the level rises.' : 'This is dry land. Tap the water to see what is happening in it.'],
+               chain: [] };
+    }
+    var o = sim.O[i], chl = sim.A[i] * CHL, t = sim.T[i], p = sim.P[i], sat = oxygenSaturation(t), night = sun(sim.t).light < 0.15;
+    // 1. Oxygen now.
+    if (o < 3) lines.push('Oxygen here is dangerously low (' + fmt(o) + ' mg/L). Fish cannot survive in it for long.');
+    else if (o < 5) lines.push('Oxygen here is low (' + fmt(o) + ' mg/L), which stresses fish.');
+    else if (o > sat + 1.5) lines.push('Oxygen here is unusually high (' + fmt(o) + ' mg/L): algae are pumping it out in the sunshine. It will fall again after dark.');
+    else lines.push('Oxygen here is healthy (' + fmt(o) + ' mg/L).');
+    // 2. Why it is low: the biggest drain in the last day's oxygen budget.
+    var drains = [[sim.bResp[i], 'resp'], [sim.bDecay[i], 'decay'], [sim.bSed[i], 'sed']];
+    drains.sort(function (a, b) { return b[0] - a[0]; });
+    var heavy = drains[0][0] > 4;                    // oxygen being used faster than the lake normally loses it
+    if (o < 5.5 || (night && heavy)) {
+      var why = drains[0][1], lead = o < 5.5 ? 'The main drain' : 'Oxygen is being used up fast here, mostly by';
+      if (why === 'resp') lines.push((o < 5.5 ? lead + ' is' : lead) + ' the algae themselves: they breathe day and night but only make oxygen in daylight, so ' + (night ? 'tonight' : 'every night') + ' they use it up.');
+      else if (why === 'decay') lines.push((o < 5.5 ? lead + ' is' : lead) + ' rotting organic matter (dead algae, sewage solids, dead fish). The bacteria that break it down use up the oxygen.');
+      else lines.push((o < 5.5 ? lead + ' is' : lead) + ' the lake bed, where dead algae and sludge that sank earlier keep rotting.');
+    } else if (sim.bAer[i] > 0.3) {
+      lines.push('An aerator nearby is adding about ' + fmt(sim.bAer[i]) + ' mg/L of oxygen a day.');
+    }
+    if (o < 5.5 && sim.bAer[i] > 0.3) lines.push('An aerator nearby is adding about ' + fmt(sim.bAer[i]) + ' mg/L a day, helping it recover.');
+    if (sim.bAer[i] > 0.3) { var na = nearestOf(e.aerators, x, y, 9); if (na) chainIds.push(na.id); }
+    // 3. Algae and where their nutrients came from.
+    if (chl < 20) lines.push('The water is clear (' + fmt(chl, 0) + ' µg/L of algae).');
+    else if (chl < 60) lines.push('The water is turning green (' + fmt(chl, 0) + ' µg/L of algae).');
+    else lines.push('A dense algae bloom covers this area (' + fmt(chl, 0) + ' µg/L of algae).');
+    if (chl >= 25) {
+      var sh = tagShares(sim, i), top = 0;
+      for (var k = 1; k < 5; k++) if (sh[k] > sh[top]) top = k;
+      var pct = Math.round(sh[top] * 100), src = null, srcPipe = null;
+      if (top === 0 && e.pipes.length) {
+        var bd = 1e9; for (k = 0; k < e.pipes.length; k++) { var d = Math.hypot(e.pipes[k].x - x, e.pipes[k].y - y); if (d < bd) { bd = d; src = e.pipes[k].entry; srcPipe = e.pipes[k]; } }
+      } else if (top === 1) src = e.rainEntry; else if (top === 2) src = e.immersionEntry;
+      if (src) {
+        lines.push('The algae grew because ' + pct + '% of the nutrients feeding them came from ' + TAG_NAMES[top] + ': ' + src.label.charAt(0).toLowerCase() + src.label.slice(1) + ' ' + ago(sim, src.t) + '.');
+        chainIds.push(src.id);
+        if (srcPipe && srcPipe.treated > 0 && srcPipe.plantEntry) {
+          lines.push('That pipe was treated ' + ago(sim, srcPipe.treatedAt) + ', which cut its nutrient load by ' + Math.round(srcPipe.treated * 100) + '%, so the lake is slowly clearing.');
+          chainIds.push(srcPipe.plantEntry.id);
+        }
+      } else if (top === 4) lines.push('The algae grew because ' + pct + '% of the nutrients here were released by the lake bed: earlier blooms sank and rotted there, and the bed gives nutrients back when the water above loses its oxygen.');
+      else lines.push('Most of the nutrients here (' + pct + '%) come from the river and natural sources.');
+      if (top !== 0 && sh[0] >= 0.15 && e.pipes.length) lines.push(Math.round(sh[0] * 100) + '% came from sewage.');
+    }
+    // 4. Amplifiers.
+    if (e.heatEntry && sim.t < e.heatUntil) { lines.push('The heat wave (water ' + fmt(t) + ' °C) is speeding up algae growth, and warm water holds less oxygen.'); chainIds.push(e.heatEntry.id); }
+    else if (e.heatEntry && sim.t < e.heatUntil + STEPS_PER_DAY) chainIds.push(e.heatEntry.id);
+    if (e.droughtEntry && sim.t < e.droughtUntil) { lines.push('The drought has lowered the lake by ' + fmt(-sim.level) + ' m, concentrating nutrients in less water.'); chainIds.push(e.droughtEntry.id); }
+    if (p > 25) {
+      var imm = e.immersionEntry && sim.t < e.immersionUntil + 3 * STEPS_PER_DAY && Math.hypot(e.immersionEntry.x - x, e.immersionEntry.y - y) < 25;
+      lines.push('The water is murky (' + fmt(p, 0) + ' NTU)' + (imm ? ' from the idol immersion' : '') + ', which blocks sunlight' + (p > 60 ? ' and is toxic to fish.' : '.'));
+      if (imm) chainIds.push(e.immersionEntry.id);
+    }
+    if (e.rainEntry && sim.t < e.rainUntil) { lines.push('Rain is washing fertiliser and soil off the shore right now.'); chainIds.push(e.rainEntry.id); }
+    // 5. Recent consequences nearby (blooms, crashes, fish kills) join the chain.
+    for (k = e.log.length - 1; k >= 0; k--) {
+      var en = e.log[k];
+      if (sim.t - en.t > 5 * STEPS_PER_DAY) break;
+      if (en.kind === 'effect' && en.x >= 0 && Math.hypot(en.x - x, en.y - y) < 22) {
+        chainIds.push(en.id);
+        if (en.type === 'fishkill' && sim.t - en.t < STEPS_PER_DAY) lines.push(en.label.charAt(0).toUpperCase() + en.label.slice(1) + ' ' + ago(sim, en.t) + '.');
+      }
+    }
+    if (lines.length <= 2 && o >= 5 && chl < 20) lines.push('Nothing is stressing this water: nutrients are scarce so algae stay sparse, and the wind keeps oxygen topped up.');
+    return { title: title, lines: lines, chain: buildChain(sim, chainIds) };
+  }
+
+  // Expand a list of log ids into a time-ordered cause chain (causes of causes too).
+  function buildChain(sim, ids) {
+    var seen = {}, out = [], queue = ids.slice();
+    while (queue.length && out.length < 12) {
+      var id = queue.shift(); if (seen[id]) continue; seen[id] = 1;
+      var en = findEntry(sim, id); if (!en) continue;
+      out.push(en);
+      for (var k = 0; k < en.causes.length; k++) queue.push(en.causes[k]);
+    }
+    out.sort(function (a, b) { return a.t - b.t || a.id - b.id; });
+    return out;
+  }
+
+  var INTENT = ['swimming with its school', 'fleeing toward water with more oxygen', 'heading into plankton-rich water to feed', 'turning away from the shallows'];
+  function explainFish(sim, k) {
+    var f = sim.fish, x = f.x[k], y = f.y[k], i = (y | 0) * W + (x | 0);
+    if (f.state[k] === 2) {
+      var cell = explainCell(sim, i);
+      return { title: 'A dead fish ' + placeName(sim, x, y), lines: ['This fish died ' + ago(sim, sim.t - f.age[k]) + '. Its body adds rotting matter, which uses up even more oxygen.'].concat(cell.lines.slice(0, 2)), chain: cell.chain };
+    }
+    var st = f.stress[k], o = sim.wet[i] ? sim.O[i] : 0, lines = [];
+    lines.push(st < 0.15 ? 'This fish is healthy.' : st < 0.6 ? 'This fish is stressed (' + Math.round(st * 100) + '% of the way to dying).' : 'This fish is close to dying (' + Math.round(st * 100) + '% stress).');
+    lines.push('It is ' + INTENT[f.intent[k]] + '. The water around it has ' + fmt(o) + ' mg/L of oxygen' + (o < 3 ? ', below the 3 mg/L fish need.' : '.'));
+    var c = explainCell(sim, i);
+    for (var q = 1; q < c.lines.length && q < 3; q++) lines.push(c.lines[q]);
+    return { title: 'A fish ' + placeName(sim, x, y), lines: lines, chain: c.chain };
+  }
+
+  // ---------- 11. Rewind: snapshots of the whole lake ----------------------
+  // Every 3 sim-hours the full state is copied into a ring of 64 slots (the
+  // last 8 days). Slots reuse their arrays, so no memory is allocated after
+  // the first 8 days. A snapshot can be shown view-only, or restored so the
+  // simulation carries on from that moment.
+  var SNAP_EVERY = 30, SNAP_MAX = 64;
+  var SNAP_F32 = ['N', 'A', 'D', 'P', 'O', 'T', 'Ms', 'Mr', 'Mi', 'Mb', 'Md', 'sed', 'aer', 'depth'];
+  var SNAP_FISH_F32 = ['x', 'y', 'vx', 'vy', 'px', 'py', 'stress', 'age', 'size'];
+  var SNAP_FISH_U8 = ['state', 'intent'];
+
+  function cloneEvents(ev) {
+    var log = ev.log.map(function (x) { return { id: x.id, t: x.t, kind: x.kind, type: x.type, label: x.label, x: x.x, y: x.y, causes: x.causes.slice(), detail: x.detail, score: x.score }; });
+    var byId = {}; log.forEach(function (l) { byId[l.id] = l; });
+    function ref(en) { return en ? (byId[en.id] || null) : null; }
+    var c = {};
+    for (var key in ev) {
+      var v = ev[key];
+      if (typeof v === 'number' || typeof v === 'boolean') c[key] = v;
+    }
+    c.log = log; c.wetland = ev.wetland.slice(); c.scoreT = ev.scoreT.slice(); c.scoreV = ev.scoreV.slice();
+    c.rainEntry = ref(ev.rainEntry); c.heatEntry = ref(ev.heatEntry); c.droughtEntry = ref(ev.droughtEntry); c.immersionEntry = ref(ev.immersionEntry);
+    c.pipes = ev.pipes.map(function (p) { return { id: p.id, x: p.x, y: p.y, treated: p.treated, load: p.load, treatedAt: p.treatedAt, entry: ref(p.entry), plantEntry: ref(p.plantEntry) }; });
+    c.aerators = ev.aerators.map(function (a) { return { id: a.id, x: a.x, y: a.y, entry: ref(a.entry) }; });
+    c.wetlands = ev.wetlands.map(function (w) { return { x: w.x, y: w.y, r: w.r, id: w.id }; });
+    return c;
+  }
+  function takeSnapshot(sim) {
+    if (sim.noSnaps) return;
+    var sn = sim.snaps, slot = sn.slots[sn.head], k, nm;
+    if (!slot) {
+      slot = sn.slots[sn.head] = { wet: new Uint8Array(N), fish: {} };
+      for (k = 0; k < SNAP_F32.length; k++) slot[SNAP_F32[k]] = new Float32Array(N);
+      for (k = 0; k < SNAP_FISH_F32.length; k++) slot.fish[SNAP_FISH_F32[k]] = new Float32Array(FISH_MAX);
+      for (k = 0; k < SNAP_FISH_U8.length; k++) slot.fish[SNAP_FISH_U8[k]] = new Uint8Array(FISH_MAX);
+    }
+    for (k = 0; k < SNAP_F32.length; k++) { nm = SNAP_F32[k]; slot[nm].set(sim[nm]); }
+    slot.wet.set(sim.wet);
+    var f = sim.fish;
+    for (k = 0; k < SNAP_FISH_F32.length; k++) { nm = SNAP_FISH_F32[k]; slot.fish[nm].set(f[nm]); }
+    for (k = 0; k < SNAP_FISH_U8.length; k++) { nm = SNAP_FISH_U8[k]; slot.fish[nm].set(f[nm]); }
+    slot.fish.alive = f.alive; slot.fish.deaths = f.deaths; slot.fish.births = f.births; slot.fish.birthAcc = f.birthAcc;
+    slot.fish.lastDeath = f.lastDeath ? { t: f.lastDeath.t, x: f.lastDeath.x, y: f.lastDeath.y } : null;
+    slot.t = sim.t; slot.level = sim.level; slot.rngState = sim.rngState; slot.score = sim.score; slot.scoreSmooth = sim.scoreSmooth;
+    slot.scoreParts = { oxygen: sim.scoreParts.oxygen, algae: sim.scoreParts.algae, clarity: sim.scoreParts.clarity, fish: sim.scoreParts.fish, level: sim.scoreParts.level };
+    slot.weather = {}; for (nm in sim.weather) slot.weather[nm] = sim.weather[nm];
+    slot.ledger = {}; for (nm in sim.ledger) slot.ledger[nm] = sim.ledger[nm];
+    slot.ev = cloneEvents(sim.ev);
+    sn.head = (sn.head + 1) % SNAP_MAX; if (sn.count < SNAP_MAX) sn.count++;
+  }
+  function snapshotCount(sim) { return sim.snaps.count; }
+  function snapshotAt(sim, k) {                     // k = 0 is the oldest
+    var sn = sim.snaps; if (k < 0 || k >= sn.count) return null;
+    return sn.slots[(sn.head - sn.count + k + 2 * SNAP_MAX) % SNAP_MAX];
+  }
+  // A light object with the same field names the renderer reads, pointing at a snapshot's arrays.
+  function snapshotView(sim, snap) {
+    return { world: sim.world, view: true, t: snap.t, level: snap.level, wet: snap.wet, depth: snap.depth,
+      N: snap.N, A: snap.A, D: snap.D, P: snap.P, O: snap.O, T: snap.T, fish: snap.fish, weather: snap.weather, ev: snap.ev,
+      scoreSmooth: snap.scoreSmooth, scoreParts: snap.scoreParts, wetCount: 0, fullWetCount: sim.fullWetCount, stats: sim.stats };
+  }
+  // Make a snapshot the live state again; later snapshots are dropped.
+  function restoreSnapshot(sim, k) {
+    var snap = snapshotAt(sim, k); if (!snap) return false;
+    var i, nm, f = sim.fish;
+    for (i = 0; i < SNAP_F32.length; i++) { nm = SNAP_F32[i]; if (nm !== 'depth') sim[nm].set(snap[nm]); }
+    sim.levelPending = 0; sim.t = snap.t; sim.level = snap.level; sim.rngState = snap.rngState; sim.score = snap.score; sim.scoreSmooth = snap.scoreSmooth;
+    for (nm in snap.weather) sim.weather[nm] = snap.weather[nm];
+    for (nm in snap.ledger) sim.ledger[nm] = snap.ledger[nm];
+    refreshWet(sim);
+    rebuildFlow(sim, 400);
+    for (i = 0; i < SNAP_FISH_F32.length; i++) { nm = SNAP_FISH_F32[i]; f[nm].set(snap.fish[nm]); }
+    for (i = 0; i < SNAP_FISH_U8.length; i++) { nm = SNAP_FISH_U8[i]; f[nm].set(snap.fish[nm]); }
+    f.alive = snap.fish.alive; f.deaths = snap.fish.deaths; f.births = snap.fish.births; f.birthAcc = snap.fish.birthAcc;
+    f.lastDeath = snap.fish.lastDeath ? { t: snap.fish.lastDeath.t, x: snap.fish.lastDeath.x, y: snap.fish.lastDeath.y } : null;
+    sim.ev = cloneEvents(snap.ev);
+    var h = sim.hist; h.count = 0; h.head = 0; h.t.fill(-1);
+    computeStats(sim); healthScore(sim); recordHistory(sim);
+    var sn = sim.snaps, oldest = (sn.head - sn.count + 2 * SNAP_MAX) % SNAP_MAX;
+    sn.count = k + 1; sn.head = (oldest + sn.count) % SNAP_MAX;
+    return true;
+  }
+
+  // ---------- 12. Scenarios: scripted stories -------------------------------
+  // Each is a list of timed items {at: sim-hours, cap: caption, act: change}.
+  // They run at 100x (one sim-day per 6 s), so about 9.5 days fit in 60 s.
+  // The runner advances the sim itself, so the script fires on exact steps
+  // and a seed always replays the same story.
+  function pipeSpot(sim, dx, dy) { var g = sim.world.ghat; return [g.x + dx + 0.5, g.y + dy + 0.5]; }
+  function openPipe(sim, dx, dy, load) {
+    var p = pipeSpot(sim, dx, dy), r = triggerEvent(sim, 'sewage', p[0], p[1]);
+    if (r.ok && load) sim.ev.pipes[sim.ev.pipes.length - 1].load = load;     // a bigger trunk sewer
+    return r;
+  }
+  function hotspots(sim, field, k, sep, low) {         // k worst cells (highest algae, or lowest oxygen)
+    var out = [], tries = 0;
+    var cand = []; for (var q = 0; q < sim.wetCount; q++) cand.push(sim.wetList[q]);
+    var arr = sim[field];
+    cand.sort(function (a, b) { return low ? arr[a] - arr[b] : arr[b] - arr[a]; });
+    for (q = 0; q < cand.length && out.length < k && tries++ < 4000; q++) {
+      var i = cand[q], x = i % W + 0.5, y = ((i / W) | 0) + 0.5, ok = sim.depth[i] > 0.6;
+      for (var j = 0; j < out.length; j++) if (Math.hypot(out[j][0] - x, out[j][1] - y) < sep) ok = false;
+      if (ok) out.push([x, y]);
+    }
+    return out;
+  }
+  function scoreText(sim) { return Math.round(sim.scoreSmooth); }
+  var SCENARIOS = {
+    festival: {
+      name: 'Festival Week', hours: 228,
+      intro: 'Festival Week: a calm lake, three days before the immersions begin.',
+      items: [
+        { at: 0, cap: 'A calm lake. In three days thousands of idols will be brought to the ghat.' },
+        { at: 40, cap: 'Immersion begins. Clay, paint, cloth and flowers cloud the water at the ghat.', act: function (s) { triggerEvent(s, 'immersion'); } },
+        { at: 64, cap: 'A second day of immersions. The paint and organic waste keep piling up.', act: function (s) { triggerEvent(s, 'immersion'); } },
+        { at: 88, cap: 'The waste is rotting and releasing nutrients. Algae wake up near the ghat.' },
+        { at: 112, cap: function (s) { return s.stats.maxChl > 40 ? 'Algae are blooming near the ghat and oxygen is crashing at night. Health score ' + scoreText(s) + '.' : 'Oxygen at the ghat crashes every night as the waste rots. Health score ' + scoreText(s) + '.'; } },
+        { at: 136, cap: 'The city bans immersion in the lake and sends in clean-up crews.', act: function (s) { buildAction(s, 'ban'); buildAction(s, 'crew'); } },
+        { at: 180, cap: 'With the source stopped, the water starts to clear.' },
+        { at: 226, cap: function (s) { return 'Festival Week ends · Health score ' + scoreText(s) + '. Rotting festival waste is why the lake suffers after the crowds leave.'; } }
+      ]
+    },
+    disaster: {
+      name: 'Sewage Disaster', hours: 228,
+      intro: 'Sewage Disaster: a healthy lake at dawn.',
+      items: [
+        { at: 0, cap: 'A healthy lake at dawn: clear water, fish schooling, plenty of oxygen.' },
+        { at: 10, cap: 'A drain from the town begins pouring raw sewage into the lake.', act: function (s) { openPipe(s, 8, 1); } },
+        { at: 28, cap: 'A second drain opens on the west side.', act: function (s) { openPipe(s, -14, 1); } },
+        { at: 50, cap: 'A heat wave: warm water holds less oxygen and algae grow faster.', act: function (s) { triggerEvent(s, 'heat'); } },
+        { at: 84, cap: 'The nutrients have fed a bloom. The water turns green near the pipes.' },
+        { at: 110, cap: function (s) { return s.fish.deaths ? 'At night the algae use up the oxygen. Fish are dying (' + s.fish.deaths + ' so far).' : 'At night the algae use up the oxygen. Fish are under stress.'; } },
+        { at: 150, cap: 'Rain washes even more nutrients in from the shore.', act: function (s) { triggerEvent(s, 'rain'); } },
+        { at: 226, cap: function (s) { return 'Health score ' + scoreText(s) + ', ' + s.fish.deaths + ' fish dead. The damage came days after the cause.'; } }
+      ]
+    },
+    recovery: {
+      name: 'Recovery Story', hours: 228,
+      intro: 'Recovery Story: setting the scene, a lake already in trouble…',
+      prep: { steps: 1680, items: [
+        { at: 0, act: function (s) { openPipe(s, 8, 1, 4.0); } },
+        { at: 36, act: function (s) { triggerEvent(s, 'heat'); } },
+        { at: 100, act: function (s) { triggerEvent(s, 'immersion'); } }
+      ] },
+      items: [
+        { at: 0, cap: function (s) { return 'A lake in crisis: bloom, oxygen crashes and a fish kill. Health score ' + scoreText(s) + '. Budget: 100 credits.'; } },
+        { at: 8, cap: 'Step 1 · Treat the source. A sewage treatment plant cuts the pipe\'s load by 90%.', act: function (s) { var p = s.ev.pipes[0]; buildAction(s, 'plant', p.x, p.y); } },
+        { at: 22, cap: 'Step 2 · Aerators put oxygen back where the fish are dying.', act: function (s) { hotspots(s, 'A', 2, 8, false).forEach(function (h) { buildAction(s, 'aerator', h[0], h[1]); }); } },
+        { at: 46, cap: 'Step 3 · A wetland buffer on the shore filters future runoff.', act: function (s) { var g = s.world.ghat; buildAction(s, 'wetland', g.x - 12, g.y); } },
+        { at: 70, cap: 'Step 4 · Immersion is banned in the lake.', act: function (s) { buildAction(s, 'ban'); } },
+        { at: 94, cap: 'Step 5 · A clean-up crew clears the sludge by the ghat.', act: function (s) { buildAction(s, 'crew'); } },
+        { at: 140, cap: function (s) { return 'Oxygen is returning and the algae are fading. Health score ' + scoreText(s) + '.'; } },
+        { at: 226, cap: function (s) { return 'Recovery · Health score ' + scoreText(s) + ', up with ' + (100 - s.ev.budget) + ' credits spent. Each fix helped, and the lake needed time.'; } }
+      ]
+    }
+  };
+  function scenarioCreate(sim, key) {
+    var def = SCENARIOS[key]; if (!def) return null;
+    return { key: key, def: def, phase: def.prep ? 'prep' : 'play', t0: sim.t, idx: 0, pidx: 0, caption: def.intro || '', done: false, steps: 0 };
+  }
+  function fireItem(sim, st, it) {
+    if (it.act) it.act(sim);
+    if (it.cap) st.caption = 'Day ' + (clock(sim.t).day + 1) + ' · ' + (typeof it.cap === 'function' ? it.cap(sim) : it.cap);
+  }
+  // One step of a scenario: fire what is due, then advance the lake.
+  function scenarioStep(sim, st) {
+    var def = st.def, rel, items;
+    if (st.phase === 'prep') {
+      rel = (sim.t - st.t0) / 10; items = def.prep.items;
+      while (st.pidx < items.length && items[st.pidx].at <= rel) fireItem(sim, st, items[st.pidx++]);
+      step(sim); st.steps++;
+      if (sim.t - st.t0 >= def.prep.steps) { st.phase = 'play'; st.t0 = sim.t; st.idx = 0; }
+      return;
+    }
+    rel = (sim.t - st.t0) / 10; items = def.items;
+    while (st.idx < items.length && items[st.idx].at <= rel) fireItem(sim, st, items[st.idx++]);
+    if (rel >= def.hours) { st.done = true; return; }
+    step(sim); st.steps++;
+  }
+
+  root.Bhoj = {
+    W: W, H: H, N: N, STEP_MIN: STEP_MIN, STEPS_PER_DAY: STEPS_PER_DAY, MAX_DEPTH: MAX_DEPTH, MIN_WET: MIN_WET,
+    mulberry32: mulberry32, rand: rand, makeNoise: makeNoise,
+    createWorld: createWorld, createSim: createSim, refreshWet: refreshWet, setLevel: setLevel,
+    step: step, clock: clock, sun: sun,
+    PAR: PAR, CHL: CHL, FIELDS: FIELDS, FISH_MAX: FISH_MAX, VMIN: VMIN,
+    totalNutrient: totalNutrient, ledgerError: ledgerError, addNutrient: addNutrient,
+    oxygenSaturation: oxygenSaturation, rebuildFlow: rebuildFlow, nearestWetCell: nearestWetCell,
+    TAGS: TAGS, TAG_NAMES: TAG_NAMES, HB: HB, HBW: HBW, HBH: HBH, FISH_START: FISH_START,
+    triggerEvent: triggerEvent, logEntry: logEntry, findEntry: findEntry, healthScore: healthScore,
+    tagShares: tagShares, causesFor: causesFor, cellHistory: cellHistory, explainCell: explainCell,
+    explainFish: explainFish, placeName: placeName, ago: ago, nearestShoreCell: nearestShoreCell, buildChain: buildChain,
+    COST: COST, buildAction: buildAction, snapshotCount: snapshotCount, snapshotAt: snapshotAt, snapshotView: snapshotView, restoreSnapshot: restoreSnapshot,
+    SCENARIOS: SCENARIOS, scenarioCreate: scenarioCreate, scenarioStep: scenarioStep, SNAP_EVERY: SNAP_EVERY
+  };
+})(typeof globalThis !== 'undefined' ? globalThis : this);
+</script>
+
+<!-- ======================================================================
+     USER INTERFACE AND RENDERING
+     ====================================================================== -->
+<script id="ui">
+(function () {
+  'use strict';
+  var B = Bhoj, W = B.W, H = B.H, N = B.N;
+
+  // ---------- A. Setup and sizing -----------------------------------------
+  var canvas = document.getElementById('map'), ctx = canvas.getContext('2d');
+  var wrap = document.getElementById('mapWrap');
+  var el = function (id) { return document.getElementById(id); };
+
+  var sim = null, world = null;
+  var speed = 10, acc = 0, lastTs = 0;
+  // Steps per real second: 1x = one sim-day per 10 min, 10x = per 60 s, 100x = per 6 s.
+  var RATE = { 0: 0, 1: 0.4, 10: 4, 100: 40 };
+  var MAX_STEPS_PER_FRAME = 8;          // a slow frame can never trigger a pile-up of steps
+
+  // Water is painted one pixel per grid cell, then scaled up smoothly.
+  var waterCanvas = document.createElement('canvas'); waterCanvas.width = W; waterCanvas.height = H;
+  var waterCtx = waterCanvas.getContext('2d');
+  var waterImg = waterCtx.createImageData(W, H), waterPx = waterImg.data;
+  // Land and scenery are drawn once into this layer and reused every frame.
+  var landCanvas = document.createElement('canvas'), landCtx = landCanvas.getContext('2d');
+  var landDirty = true, landLevel = 0, resizeTimer = 0;
+  var ripples = [];
+  // armed: the tool waiting for a tap on the map ('sewage', 'aerator', 'plant', 'wetland') or null.
+  // selection: {kind:'cell', i} or {kind:'fish', k}. S is what is drawn: the live sim, or a snapshot in Rewind.
+  var armed = null, selection = null, S = null, view = null, replay = null, scn = null, layer = 'normal';
+  var toolbar = el('toolbar'), strip = el('strip');
+
+  function fitCanvas() {
+    // Largest 16:10 box that fits between the toolbar and the caption strip.
+    var cs = getComputedStyle(wrap), narrow = window.innerWidth <= 900;
+    var availW = wrap.clientWidth - parseFloat(cs.paddingLeft) - parseFloat(cs.paddingRight);
+    var availH = narrow ? 1e9 : wrap.clientHeight - parseFloat(cs.paddingTop) - parseFloat(cs.paddingBottom) - toolbar.offsetHeight - strip.offsetHeight - 16;
+    var cssW = Math.max(160, Math.floor(Math.min(availW, availH * W / H)));
+    var cssH = Math.floor(cssW * H / W);
+    var dpr = Math.min(2, window.devicePixelRatio || 1);
+    canvas.style.width = cssW + 'px'; canvas.style.height = cssH + 'px';
+    toolbar.style.width = cssW + 'px'; strip.style.width = cssW + 'px';
+    var bw = Math.round(cssW * dpr), bh = Math.round(cssH * dpr);
+    if (canvas.width !== bw || canvas.height !== bh) {
+      canvas.width = bw; canvas.height = bh;
+      clearTimeout(resizeTimer);                              // rebuild scenery once resizing settles
+      resizeTimer = setTimeout(function () { landDirty = true; }, 150);
+    }
+  }
+
+  // ---------- B. Static scenery layer -------------------------------------
+  var TREE_COLORS = ['#3f7d4a', '#4c8f52', '#5a9a4e', '#3a7050'];
+  var ROOF_COLORS = ['#c96f4a', '#d98a5a', '#b85c44', '#e0b070'];
+
+  function strokePath(g, pts, width, color) {
+    g.strokeStyle = color; g.lineWidth = width; g.lineCap = 'round'; g.lineJoin = 'round';
+    g.beginPath(); g.moveTo(pts[0].x, pts[0].y);
+    for (var i = 1; i < pts.length; i++) g.lineTo(pts[i].x, pts[i].y);
+    g.stroke();
+  }
+
+  function buildLand() {
+    var lw = Math.max(320, Math.min(canvas.width, 1800)), lh = Math.round(lw * H / W);
+    landCanvas.width = lw; landCanvas.height = lh;
+    var img = landCtx.createImageData(lw, lh), px = img.data;
+    var bed = world.bed, fbm = world.noise.fbm, level = S.level;
+
+    // Land pixels: sample the smooth bed surface between cell centres, so the
+    // shoreline is a clean curve instead of grid-shaped steps.
+    for (var py = 0; py < lh; py++) {
+      var gy = (py + 0.5) / lh * H - 0.5, y0 = Math.max(0, Math.min(H - 2, Math.floor(gy)));
+      var fy = Math.max(0, Math.min(1, gy - y0));
+      for (var pxi = 0; pxi < lw; pxi++) {
+        var gx = (pxi + 0.5) / lw * W - 0.5, x0 = Math.max(0, Math.min(W - 2, Math.floor(gx)));
+        var fx = Math.max(0, Math.min(1, gx - x0)), i = y0 * W + x0;
+        var b = (bed[i] * (1 - fx) + bed[i + 1] * fx) * (1 - fy) + (bed[i + W] * (1 - fx) + bed[i + W + 1] * fx) * fy;
+        var d = b + level;                                   // water depth at this pixel
+        if (d >= 0.25) continue;                             // open water: leave transparent
+        var o = (py * lw + pxi) * 4;
+        var aLand = d <= -0.04 ? 1 : d >= 0.04 ? 0 : 0.5 - d / 0.08;
+        if (aLand <= 0) {                                    // pale foam line just off the shore
+          px[o] = 255; px[o + 1] = 255; px[o + 2] = 255; px[o + 3] = 75 * (1 - d / 0.25);
+          continue;
+        }
+        var n = fbm(gx * 0.22, gy * 0.22, 2) * 0.5 + 0.5, r, g, bl;
+        if (b > 0) {                                         // lake bed exposed by low water: mud
+          r = 128 - 14 * n; g = 110 - 12 * n; bl = 84 - 10 * n;
+        } else {
+          var h = -b, t = Math.max(0, Math.min(1, (h - 0.12) / 0.4)); t = t * t * (3 - 2 * t);
+          var gr = 112 + 30 * n, gg = 160 + 22 * n, gb = 88 + 14 * n;      // grass
+          r = 226 + (gr - 226) * t; g = 209 + (gg - 209) * t; bl = 164 + (gb - 164) * t;   // sand to grass
+        }
+        px[o] = r; px[o + 1] = g; px[o + 2] = bl; px[o + 3] = 255 * aLand;
+      }
+    }
+    landCtx.setTransform(1, 0, 0, 1, 0, 0);
+    landCtx.putImageData(img, 0, 0);
+
+    // Vector scenery, drawn in grid units (cell centre = index + 0.5).
+    var s = lw / W, g2 = landCtx, k, p;
+    g2.setTransform(s, 0, 0, s, s * 0.5, s * 0.5);
+
+    // River in from the west and the spillway stream out to the east.
+    strokePath(g2, world.river, 2.5, '#d6c79c'); strokePath(g2, world.river, 1.5, '#5fb9be');
+    strokePath(g2, world.spill, 2.0, '#d6c79c'); strokePath(g2, world.spill, 1.1, '#5fb9be');
+
+    // A small wooden bridge over the river.
+    var mid = (world.river.length / 2) | 0, pa = world.river[mid - 1], pb = world.river[mid + 1];
+    g2.save();
+    g2.translate(world.river[mid].x, world.river[mid].y);
+    g2.rotate(Math.atan2(pb.y - pa.y, pb.x - pa.x) + Math.PI / 2);
+    g2.fillStyle = 'rgba(0,0,0,0.2)'; g2.fillRect(-2.0, -0.45, 4.2, 1.3);
+    g2.fillStyle = '#8f6c48'; g2.fillRect(-2.1, -0.65, 4.2, 1.3);
+    g2.strokeStyle = '#6f5236'; g2.lineWidth = 0.1;
+    for (k = -1.7; k <= 1.8; k += 0.5) { g2.beginPath(); g2.moveTo(k, -0.65); g2.lineTo(k, 0.65); g2.stroke(); }
+    g2.restore();
+
+    // Ghat: stone steps going down into the water, with a small temple behind.
+    var gh = world.ghat;
+    for (k = 0; k < 5; k++) {
+      g2.fillStyle = k % 2 ? '#cbbfac' : '#e0d6c6';
+      g2.fillRect(gh.x - 3.6 + k * 0.25, gh.y - 0.9 - k * 0.5, 7.2 - k * 0.5, 0.5);
+    }
+    g2.fillStyle = 'rgba(0,0,0,0.2)'; g2.fillRect(gh.x - 0.9, gh.y - 5.0, 2.2, 2.2);
+    g2.fillStyle = '#f1e7d6'; g2.fillRect(gh.x - 1.1, gh.y - 5.3, 2.2, 2.2);
+    g2.fillStyle = '#e8963a'; g2.beginPath(); g2.arc(gh.x, gh.y - 4.2, 0.75, 0, 6.2832); g2.fill();
+    g2.fillStyle = '#f6c56a'; g2.beginPath(); g2.arc(gh.x - 0.15, gh.y - 4.35, 0.3, 0, 6.2832); g2.fill();
+
+    // Town buildings: soft shadow, pale walls, warm tiled roof with a ridge line.
+    for (k = 0; k < world.buildings.length; k++) {
+      p = world.buildings[k];
+      g2.save(); g2.translate(p.x, p.y); g2.rotate(p.a);
+      g2.fillStyle = 'rgba(0,0,0,0.2)'; g2.fillRect(-p.w / 2 + 0.3, -p.h / 2 + 0.35, p.w, p.h);
+      g2.fillStyle = '#efe4cf'; g2.fillRect(-p.w / 2, -p.h / 2, p.w, p.h);
+      g2.fillStyle = ROOF_COLORS[p.c]; g2.fillRect(-p.w / 2 + 0.18, -p.h / 2 + 0.18, p.w - 0.36, p.h - 0.36);
+      g2.strokeStyle = 'rgba(255,255,255,0.35)'; g2.lineWidth = 0.1;
+      g2.beginPath(); g2.moveTo(-p.w / 2 + 0.3, 0); g2.lineTo(p.w / 2 - 0.3, 0); g2.stroke();
+      g2.restore();
+    }
+
+    // Trees: shadow, canopy, highlight.
+    for (k = 0; k < world.trees.length; k++) {
+      p = world.trees[k];
+      g2.fillStyle = 'rgba(20,40,30,0.22)'; g2.beginPath(); g2.arc(p.x + p.r * 0.3, p.y + p.r * 0.35, p.r, 0, 6.2832); g2.fill();
+      g2.fillStyle = TREE_COLORS[p.c]; g2.beginPath(); g2.arc(p.x, p.y, p.r, 0, 6.2832); g2.fill();
+      g2.fillStyle = 'rgba(190,225,150,0.35)'; g2.beginPath(); g2.arc(p.x - p.r * 0.28, p.y - p.r * 0.28, p.r * 0.5, 0, 6.2832); g2.fill();
+    }
+
+    // A small white shrine on the first island.
+    if (world.islands.length) {
+      p = world.islands[0];
+      g2.fillStyle = 'rgba(0,0,0,0.2)'; g2.beginPath(); g2.arc(p.x + 0.25, p.y + 0.3, 0.95, 0, 6.2832); g2.fill();
+      g2.fillStyle = '#f7f3ea'; g2.beginPath(); g2.arc(p.x, p.y, 0.95, 0, 6.2832); g2.fill();
+      g2.fillStyle = '#dfe9e2'; g2.beginPath(); g2.arc(p.x, p.y, 0.5, 0, 6.2832); g2.fill();
+      g2.fillStyle = '#e8763a'; g2.beginPath(); g2.moveTo(p.x, p.y - 0.2); g2.lineTo(p.x + 1.1, p.y - 0.55); g2.lineTo(p.x, p.y - 0.9); g2.fill();
+    }
+    g2.setTransform(1, 0, 0, 1, 0, 0);
+    landDirty = false; landLevel = S.level;
+  }
+
+  // Ripple marks: a fixed, capped set of little wavelets on the water.
+  function buildRipples() {
+    var rng = B.mulberry32(sim.seed + 7);
+    ripples = [];
+    for (var k = 0; k < 4000 && ripples.length < 110; k++) {
+      var x = rng() * (W - 1), y = rng() * (H - 1);
+      if (world.bed[Math.round(y) * W + Math.round(x)] < 0.6) continue;
+      ripples.push({ x: x, y: y, ph: rng() * 6.2832, len: 1.2 + rng() * 2.2 });
+    }
+  }
+
+  // ---------- C. Per-frame rendering --------------------------------------
+  // ----- Sky and weather: cloud shadows, stars, moon, sun/moon dial -----
+  var clouds = [], stars = [], lastRS = 0;
+  function buildSky() {
+    var rng = B.mulberry32(sim.seed + 99), k; clouds = []; stars = [];
+    for (k = 0; k < 8; k++) clouds.push({ x: rng() * (W + 80) - 40, y: rng() * (H + 40) - 20, r: 15 + rng() * 17, a: 0.6 + rng() * 0.4, v: 0.7 + rng() * 0.6 });
+    for (k = 0; k < 150; k++) stars.push({ x: rng() * W, y: rng() * H, r: 0.35 + rng() * 0.7, ph: rng() * 6.28, sp: 0.6 + rng() * 1.6 });
+  }
+  // Soft cloud shadows drift across the lake with the wind; more cover = more of them, darker.
+  function drawClouds(realSeconds, s, sn) {
+    var dt = Math.min(0.1, Math.max(0, realSeconds - lastRS)); lastRS = realSeconds;
+    var wth = S.weather, cover = wth.cloud, n = Math.ceil(cover * clouds.length), wx = Math.cos(wth.windDir), wy = Math.sin(wth.windDir), sp = 0.8 + wth.wind * 0.5;
+    var day = 0.35 + 0.65 * sn.light;
+    for (var k = 0; k < clouds.length; k++) {
+      var c = clouds[k];
+      c.x += wx * sp * c.v * dt; c.y += wy * sp * c.v * dt * 0.6;
+      if (c.x > W + 40) c.x -= W + 80; else if (c.x < -40) c.x += W + 80;
+      if (c.y > H + 20) c.y -= H + 40; else if (c.y < -20) c.y += H + 40;
+      if (k >= n) continue;
+      var alpha = (0.1 + 0.24 * cover) * c.a * day, r = c.r * s;
+      ctx.save(); ctx.translate(c.x * s, c.y * s); ctx.scale(1.6, 1);
+      var g = ctx.createRadialGradient(0, 0, 0, 0, 0, r);
+      g.addColorStop(0, 'rgba(10,26,42,' + alpha.toFixed(3) + ')'); g.addColorStop(1, 'rgba(10,26,42,0)');
+      ctx.fillStyle = g; ctx.fillRect(-r, -r, 2 * r, 2 * r); ctx.restore();
+    }
+  }
+  // After dark: twinkling stars, moonlight glitter on the water, a moon disc, and a small sun/moon dial.
+  function drawSky(realSeconds, s, sn) {
+    var cw = canvas.width, k, night = 1 - Math.min(1, sn.light / 0.6);
+    if (night > 0.02) {
+      for (k = 0; k < stars.length; k++) {
+        var st = stars[k], a = night * (0.35 + 0.5 * Math.sin(realSeconds * st.sp + st.ph) * 0.5 + 0.25) * (S.wet[(st.y | 0) * W + (st.x | 0)] ? 0.9 : 0.55);
+        ctx.fillStyle = 'rgba(255,250,235,' + Math.max(0, a).toFixed(3) + ')';
+        ctx.fillRect(st.x * s, st.y * s, st.r * s * 0.55, st.r * s * 0.55);
+      }
+    }
+    var hour = sn.hour, isNight = sn.elev < 0.02;
+    if (isNight) {
+      var p = ((hour - 18 + 24) % 24) / 12, mx = W * (0.9 - 0.8 * p), my = H * (0.2 - 0.1 * Math.sin(Math.PI * p));
+      var glow = ctx.createRadialGradient(mx * s, my * s, 0, mx * s, my * s, s * 7);
+      glow.addColorStop(0, 'rgba(235,240,255,0.30)'); glow.addColorStop(1, 'rgba(235,240,255,0)');
+      ctx.fillStyle = glow; ctx.fillRect((mx - 7) * s, (my - 7) * s, 14 * s, 14 * s);
+      ctx.fillStyle = 'rgba(245,244,228,0.95)'; ctx.beginPath(); ctx.arc(mx * s, my * s, s * 1.5, 0, 6.2832); ctx.fill();
+      ctx.fillStyle = 'rgba(205,205,195,0.55)'; ctx.beginPath(); ctx.arc(mx * s - s * 0.45, my * s - s * 0.2, s * 0.4, 0, 6.2832); ctx.arc(mx * s + s * 0.4, my * s + s * 0.5, s * 0.28, 0, 6.2832); ctx.fill();
+      for (k = 0; k < 46; k++) {                                       // moon path on the water
+        var gx = mx + Math.sin(k * 12.9898) * 5 * (0.3 + k / 46), gy = H * 0.26 + k * H * 0.011 + Math.sin(k * 78.233) * 2;
+        if (!S.wet[(gy | 0) * W + (gx | 0)]) continue;
+        var ga = 0.55 * (0.4 + 0.6 * Math.sin(realSeconds * 2.2 + k * 1.7) * 0.5 + 0.3) * (1 - k / 60);
+        ctx.fillStyle = 'rgba(245,248,255,' + Math.max(0, ga).toFixed(3) + ')'; ctx.fillRect(gx * s, gy * s, s * 0.9, s * 0.16);
+      }
+    }
+    // Dial: where the sun (or moon) is in its arc, in the corner of the map.
+    var r = s * 3.3, dx = r + s * 1.2, dy = r + s * 1.2, ang = Math.PI * (1 - ((hour - 6 + 24) % 12) / 12);
+    ctx.fillStyle = 'rgba(8,20,32,0.55)'; ctx.beginPath(); ctx.arc(dx, dy, r, 0, 6.2832); ctx.fill();
+    ctx.strokeStyle = 'rgba(255,255,255,0.35)'; ctx.lineWidth = Math.max(1, s * 0.1); ctx.beginPath(); ctx.arc(dx, dy + r * 0.25, r * 0.72, Math.PI, 0); ctx.stroke();
+    ctx.beginPath(); ctx.moveTo(dx - r * 0.85, dy + r * 0.25); ctx.lineTo(dx + r * 0.85, dy + r * 0.25); ctx.stroke();
+    var ix = dx + Math.cos(ang) * r * 0.72, iy = dy + r * 0.25 - Math.sin(ang) * r * 0.72;
+    if (isNight) { ctx.fillStyle = '#f2efd9'; ctx.beginPath(); ctx.arc(ix, iy, s * 0.8, 0, 6.2832); ctx.fill(); ctx.fillStyle = 'rgba(8,20,32,0.9)'; ctx.beginPath(); ctx.arc(ix + s * 0.35, iy - s * 0.1, s * 0.7, 0, 6.2832); ctx.fill(); }
+    else { ctx.fillStyle = '#ffd25a'; ctx.beginPath(); ctx.arc(ix, iy, s * 0.85, 0, 6.2832); ctx.fill(); ctx.strokeStyle = 'rgba(255,210,90,0.8)'; ctx.lineWidth = Math.max(1, s * 0.12); ctx.beginPath();
+      for (k = 0; k < 8; k++) { var aa = k * 0.7854; ctx.moveTo(ix + Math.cos(aa) * s * 1.15, iy + Math.sin(aa) * s * 1.15); ctx.lineTo(ix + Math.cos(aa) * s * 1.55, iy + Math.sin(aa) * s * 1.55); } ctx.stroke(); }
+  }
+
+  // Pipes, interventions, the selection ring and rain streaks are drawn over the water.
+  function drawMarks(realSeconds, s) {
+    var ev = S.ev, pipes = ev.pipes, k, i, p, pulse = 0.5 + 0.5 * Math.sin(realSeconds * 5), g = world.ghat, cx, cy;
+    // Wetland buffers: reeds along the protected shore.
+    if (ev.wetlands.length) {
+      ctx.fillStyle = 'rgba(72,150,84,0.5)'; ctx.beginPath();
+      for (i = 0; i < N; i++) if (ev.wetland[i]) { cx = (i % W + 0.5) * s; cy = (((i / W) | 0) + 0.5) * s; ctx.moveTo(cx + s * 0.9, cy); ctx.arc(cx, cy, s * 0.9, 0, 6.2832); }
+      ctx.fill();
+      ctx.strokeStyle = '#2d6b3b'; ctx.lineWidth = Math.max(1, s * 0.1); ctx.beginPath();
+      for (i = 0; i < N; i++) if (ev.wetland[i]) {
+        cx = (i % W + 0.5) * s; cy = (((i / W) | 0) + 0.5) * s; var sway = Math.sin(realSeconds * 1.4 + i) * s * 0.12;
+        ctx.moveTo(cx - s * 0.3, cy + s * 0.5); ctx.lineTo(cx - s * 0.3 + sway, cy - s * 0.6);
+        ctx.moveTo(cx + s * 0.3, cy + s * 0.5); ctx.lineTo(cx + s * 0.3 - sway, cy - s * 0.7);
+      }
+      ctx.stroke();
+    }
+    // Sewage pipes (red while leaking, green once treated) and their treatment plants.
+    for (k = 0; k < pipes.length; k++) {
+      p = pipes[k]; var px = p.x * s, py = p.y * s, r = s * 1.1, open = 1 - p.treated;
+      ctx.fillStyle = '#6b727a'; ctx.strokeStyle = '#242a30'; ctx.lineWidth = Math.max(1.5, s * 0.15);
+      ctx.beginPath(); ctx.arc(px, py, r, 0, 6.2832); ctx.fill(); ctx.stroke();
+      ctx.fillStyle = open > 0.5 ? 'rgba(210,90,60,' + (0.6 + 0.4 * pulse) + ')' : 'rgba(110,200,140,0.95)';
+      ctx.beginPath(); ctx.arc(px, py, r * 0.5, 0, 6.2832); ctx.fill();
+      if (p.treated > 0) {
+        var bx = px + s * 1.4, by = py - s * 2.4, bw = s * 2.2;
+        ctx.fillStyle = '#2f8f55'; ctx.strokeStyle = '#e8f6ec'; ctx.lineWidth = Math.max(1.5, s * 0.14);
+        ctx.fillRect(bx - bw / 2, by - bw / 2, bw, bw); ctx.strokeRect(bx - bw / 2, by - bw / 2, bw, bw);
+        ctx.beginPath(); ctx.moveTo(bx - bw * 0.25, by); ctx.lineTo(bx + bw * 0.25, by); ctx.moveTo(bx, by - bw * 0.25); ctx.lineTo(bx, by + bw * 0.25); ctx.stroke();
+      }
+    }
+    // Aerators: a buoy with bubbles rising and rings spreading.
+    for (k = 0; k < ev.aerators.length; k++) {
+      p = ev.aerators[k]; cx = p.x * s; cy = p.y * s;
+      for (i = 0; i < 2; i++) {
+        var ph = (realSeconds * 0.7 + k * 0.37 + i * 0.5) % 1;
+        ctx.strokeStyle = 'rgba(200,235,255,' + (0.55 * (1 - ph)).toFixed(3) + ')'; ctx.lineWidth = Math.max(1, s * 0.12);
+        ctx.beginPath(); ctx.arc(cx, cy, s * (0.8 + ph * 3.0), 0, 6.2832); ctx.stroke();
+      }
+      ctx.fillStyle = 'rgba(210,240,255,0.9)';
+      for (i = 0; i < 4; i++) { var bp = (realSeconds * 1.1 + i * 0.25 + k) % 1; ctx.beginPath(); ctx.arc(cx + Math.sin(i * 2 + realSeconds * 2) * s * 0.5, cy - bp * s * 1.6, s * 0.16, 0, 6.2832); ctx.fill(); }
+      ctx.fillStyle = '#f2f7fa'; ctx.strokeStyle = '#2a6fb0'; ctx.lineWidth = Math.max(1.5, s * 0.16);
+      ctx.beginPath(); ctx.arc(cx, cy, s * 0.65, 0, 6.2832); ctx.fill(); ctx.stroke();
+      ctx.fillStyle = '#2a6fb0'; ctx.beginPath(); ctx.arc(cx, cy, s * 0.25, 0, 6.2832); ctx.fill();
+    }
+    // Immersion ban sign at the ghat; clean-up crew ring for a day after it is sent.
+    if (ev.banImmersion) {
+      cx = (g.x + 5) * s; cy = (g.y - 3) * s; ctx.fillStyle = '#fff'; ctx.strokeStyle = '#d03b3b'; ctx.lineWidth = Math.max(2, s * 0.26);
+      ctx.beginPath(); ctx.arc(cx, cy, s * 1.1, 0, 6.2832); ctx.fill(); ctx.stroke();
+      ctx.beginPath(); ctx.moveTo(cx - s * 0.75, cy + s * 0.75); ctx.lineTo(cx + s * 0.75, cy - s * 0.75); ctx.stroke();
+    }
+    if (ev.crewAt >= 0 && S.t - ev.crewAt < 150) {
+      var cp = (S.t - ev.crewAt) / 150; ctx.strokeStyle = 'rgba(255,255,255,' + (0.6 * (1 - cp)).toFixed(3) + ')'; ctx.lineWidth = Math.max(2, s * 0.2);
+      ctx.setLineDash([s * 0.6, s * 0.5]); ctx.beginPath(); ctx.arc((g.x + 0.5) * s, (g.y + 1.5) * s, s * (2 + cp * 9), 0, 6.2832); ctx.stroke(); ctx.setLineDash([]);
+    }
+    if (selection && !replay) {
+      var sx, sy;
+      if (selection.kind === 'fish') { sx = sim.fish.x[selection.k]; sy = sim.fish.y[selection.k]; }
+      else { sx = selection.i % W + 0.5; sy = ((selection.i / W) | 0) + 0.5; }
+      ctx.strokeStyle = 'rgba(255,255,255,' + (0.7 + 0.3 * pulse) + ')'; ctx.lineWidth = Math.max(2, s * 0.2);
+      ctx.beginPath(); ctx.arc(sx * s, sy * s, s * (selection.kind === 'fish' ? 1.6 : 2.2) * (1 + 0.08 * pulse), 0, 6.2832); ctx.stroke();
+      ctx.strokeStyle = 'rgba(20,30,40,0.5)'; ctx.lineWidth = Math.max(1, s * 0.08);
+      ctx.beginPath(); ctx.arc(sx * s, sy * s, s * (selection.kind === 'fish' ? 1.6 : 2.2) * (1 + 0.08 * pulse) + s * 0.18, 0, 6.2832); ctx.stroke();
+    }
+    if (S.weather.rain) {                       // ripple rings where drops land, then streaks blown along the wind
+      ctx.lineWidth = Math.max(1, s * 0.07);
+      for (k = 0; k < 40; k++) {
+        var cyc = realSeconds * (0.9 + (k % 4) * 0.15) + k * 0.37, cid = Math.floor(cyc), ph = cyc - cid;
+        var gx = 6 + ((cid * 131 + k * 977) % 1000) / 1000 * (W - 12), gy = 6 + ((cid * 271 + k * 353) % 1000) / 1000 * (H - 12);
+        if (!S.wet[(gy | 0) * W + (gx | 0)]) continue;
+        ctx.strokeStyle = 'rgba(235,245,255,' + (0.55 * (1 - ph)).toFixed(3) + ')';
+        ctx.beginPath(); ctx.ellipse(gx * s, gy * s, s * (0.3 + ph * 1.5), s * (0.2 + ph * 0.9), 0, 0, 6.2832); ctx.stroke();
+      }
+      var cw = canvas.width, ch = canvas.height, wx = Math.cos(S.weather.windDir) * 0.5;
+      ctx.strokeStyle = 'rgba(210,225,240,0.35)'; ctx.lineWidth = Math.max(1, s * 0.08); ctx.beginPath();
+      for (k = 0; k < 120; k++) {
+        var u = (k * 0.6180339 + realSeconds * (1.2 + (k % 5) * 0.12)) % 1, v = (k * 0.7548777 + 0.31) % 1;
+        var rx = ((v * cw + u * ch * wx * 0.5) % cw + cw) % cw, ry = u * ch;
+        ctx.moveTo(rx, ry); ctx.lineTo(rx + wx * s * 1.2, ry + s * 2.2);
+      }
+      ctx.stroke();
+    }
+  }
+
+  // Flow arrows: current speed per cell comes from the face fluxes of the flow solver;
+  // each arrow averages a 5x5 block of cells. Longer arrow = faster current.
+  var fvx = new Float32Array(N), fvy = new Float32Array(N);
+  function drawFlow(s) {
+    var n = sim.faceCount, I = sim.faceI, J = sim.faceJ, F = sim.faceF, Hh = sim.faceH, X = sim.faceX, f, v, bx, by, x, y;
+    fvx.fill(0); fvy.fill(0);
+    for (f = 0; f < n; f++) {
+      v = F[f] / Hh[f] * 0.5;
+      if (X[f]) { fvx[I[f]] += v; fvx[J[f]] += v; } else { fvy[I[f]] += v; fvy[J[f]] += v; }
+    }
+    ctx.lineCap = 'round'; ctx.lineJoin = 'round';
+    for (by = 2; by < H; by += 5) for (bx = 2; bx < W; bx += 5) {
+      var sx = 0, sy = 0, c = 0;
+      for (y = by - 2; y <= by + 2 && y < H; y++) for (x = bx - 2; x <= bx + 2 && x < W; x++) { var i = y * W + x; if (sim.wet[i]) { sx += fvx[i]; sy += fvy[i]; c++; } }
+      if (c < 15) continue;
+      sx /= c; sy /= c;
+      var sp = Math.sqrt(sx * sx + sy * sy), len = Math.min(4.2, 0.9 + sp * 14);
+      if (sp < 1e-5) continue;
+      var ux = sx / sp, uy = sy / sp, x0 = (bx + 0.5 - ux * len / 2) * s, y0 = (by + 0.5 - uy * len / 2) * s, x1 = (bx + 0.5 + ux * len / 2) * s, y1 = (by + 0.5 + uy * len / 2) * s;
+      var hd = s * 0.55;
+      ctx.strokeStyle = 'rgba(10,25,40,0.55)'; ctx.lineWidth = Math.max(3, s * 0.38);
+      ctx.beginPath(); ctx.moveTo(x0, y0); ctx.lineTo(x1, y1); ctx.stroke();
+      ctx.beginPath(); ctx.moveTo(x1 - ux * hd - uy * hd * 0.6, y1 - uy * hd + ux * hd * 0.6); ctx.lineTo(x1, y1); ctx.lineTo(x1 - ux * hd + uy * hd * 0.6, y1 - uy * hd - ux * hd * 0.6); ctx.stroke();
+      ctx.strokeStyle = 'rgba(255,255,255,0.92)'; ctx.lineWidth = Math.max(1.5, s * 0.17);
+      ctx.beginPath(); ctx.moveTo(x0, y0); ctx.lineTo(x1, y1); ctx.stroke();
+      ctx.beginPath(); ctx.moveTo(x1 - ux * hd - uy * hd * 0.6, y1 - uy * hd + ux * hd * 0.6); ctx.lineTo(x1, y1); ctx.lineTo(x1 - ux * hd + uy * hd * 0.6, y1 - uy * hd - ux * hd * 0.6); ctx.stroke();
+    }
+  }
+
+  // Colour ramps for the heat maps (also drawn as the legends).
+  var PALETTES = {
+    oxygen: { title: 'Dissolved oxygen (mg/L)', max: 9, ticks: [0, 3, 6, 9], note: 'below 3 fish cannot survive',
+      stops: [[0, '#7f1d1d'], [0.2, '#d9480f'], [0.35, '#f2b84b'], [0.55, '#d8e8a0'], [0.75, '#62c0c9'], [1, '#1f5fa8']] },
+    algae: { title: 'Algae (chlorophyll, µg/L)', max: 150, ticks: [0, 25, 50, 100, 150], note: 'above 100 is a bloom',
+      stops: [[0, '#1d4f66'], [0.15, '#3a9d8f'], [0.4, '#8cc63f'], [0.7, '#e3e21b'], [1, '#fff7a0']] },
+    pollution: { title: 'Pollution and turbidity (NTU)', max: 100, ticks: [0, 25, 50, 100], note: 'above 60 is toxic to fish',
+      stops: [[0, '#1d4f66'], [0.2, '#7e8f77'], [0.45, '#c9a45a'], [0.75, '#9c5a22'], [1, '#4a210c']] }
+  };
+  function hexRgb(h) { return [parseInt(h.substr(1, 2), 16), parseInt(h.substr(3, 2), 16), parseInt(h.substr(5, 2), 16)]; }
+  Object.keys(PALETTES).forEach(function (key) {
+    var pal = PALETTES[key], lut = new Uint8Array(256 * 3), q = 0;
+    for (var i = 0; i < 256; i++) {
+      var t = i / 255; while (q < pal.stops.length - 2 && t > pal.stops[q + 1][0]) q++;
+      var a = pal.stops[q], b2 = pal.stops[q + 1], u = Math.max(0, Math.min(1, (t - a[0]) / (b2[0] - a[0]))), ca = hexRgb(a[1]), cb = hexRgb(b2[1]);
+      for (var c = 0; c < 3; c++) lut[i * 3 + c] = ca[c] + (cb[c] - ca[c]) * u;
+    }
+    pal.lut = lut;
+  });
+
+  // Fish are batched by stress level so each colour is one fill() call.
+  // The transform is changed per fish while the path is being built; canvas
+  // applies it to each point as it is added, so one path holds every fish.
+  var FISH_FILL = ['rgba(226,236,240,0.95)', 'rgba(240,222,196,0.95)', 'rgba(244,176,140,0.95)', 'rgba(236,108,88,0.97)'];
+  function drawFish(alpha, realSeconds, s) {
+    var f = S.fish, M = f.state.length, lvl, k;
+    for (lvl = 0; lvl < 4; lvl++) {
+      var any = false;
+      ctx.beginPath();
+      for (k = 0; k < M; k++) {
+        if (f.state[k] !== 1) continue;
+        var st = f.stress[k], L = st < 0.2 ? 0 : st < 0.45 ? 1 : st < 0.7 ? 2 : 3;
+        if (L !== lvl) continue;
+        any = true;
+        var x = f.px[k] + (f.x[k] - f.px[k]) * alpha, y = f.py[k] + (f.y[k] - f.py[k]) * alpha;
+        var ang = Math.atan2(f.vy[k], f.vx[k]) + 0.16 * Math.sin(realSeconds * (6 + 6 * st) + k * 1.7);
+        var sz = s * f.size[k], c = Math.cos(ang) * sz, sn = Math.sin(ang) * sz;
+        ctx.setTransform(c, sn, -sn, c, x * s, y * s);
+        ctx.moveTo(0.6, 0);
+        ctx.quadraticCurveTo(0.1, -0.27, -0.33, -0.05);
+        ctx.lineTo(-0.62, -0.22); ctx.lineTo(-0.5, 0); ctx.lineTo(-0.62, 0.22); ctx.lineTo(-0.33, 0.05);
+        ctx.quadraticCurveTo(0.1, 0.27, 0.6, 0);
+        ctx.closePath();
+      }
+      ctx.setTransform(1, 0, 0, 1, 0, 0);
+      if (any) { ctx.fillStyle = FISH_FILL[lvl]; ctx.fill(); }
+    }
+    // Dead fish float belly-up and fade over a day.
+    for (k = 0; k < M; k++) {
+      if (f.state[k] !== 2) continue;
+      var fade = 1 - f.age[k] / B.STEPS_PER_DAY; if (fade <= 0) continue;
+      var dx = f.px[k] + (f.x[k] - f.px[k]) * alpha, dy = f.py[k] + (f.y[k] - f.py[k]) * alpha, r = s * f.size[k] * 0.32;
+      ctx.fillStyle = 'rgba(250,246,232,' + (0.85 * fade).toFixed(3) + ')';
+      ctx.beginPath(); ctx.ellipse(dx * s, dy * s, r * 1.6, r, k, 0, 6.2832); ctx.fill();
+      ctx.strokeStyle = 'rgba(120,60,50,' + (0.6 * fade).toFixed(3) + ')'; ctx.lineWidth = Math.max(1, s * 0.08); ctx.stroke();
+    }
+  }
+
+  function render(tNow, realSeconds) {
+    var cw = canvas.width, ch = canvas.height, s = cw / W, i, k;
+    if (landDirty || Math.abs(S.level - landLevel) > 0.05) buildLand();
+
+    // Water colour comes straight from the simulation: clear water is
+    // turquoise in the shallows and deep blue in the middle; algae tint it
+    // green (a bloom turns it pea-soup green); turbidity browns it.
+    // The heat-map layers paint the chosen field with a fixed colour ramp instead.
+    var bed = world.bed, level = S.level, A = S.A, P = S.P, wet = S.wet;
+    var pal = PALETTES[layer], lut = pal ? pal.lut : null, fld = layer === 'oxygen' ? S.O : layer === 'algae' ? A : P;
+    var fscale = layer === 'oxygen' ? 255 / 9 : layer === 'algae' ? 255 : 2.55;      // field value -> 0..255 ramp index
+    for (i = 0; i < N; i++) {
+      var d = bed[i] + level, t = d <= 0 ? 0 : d >= 6 ? 1 : d / 6, o = i * 4;
+      t = Math.sqrt(t);
+      var r = 95 - 57 * t, g = 185 - 77 * t, b = 190 - 28 * t;
+      if (wet[i]) {
+        if (lut) {
+          var q = fld[i] * fscale; q = q < 0 ? 0 : q > 255 ? 255 : q | 0;
+          r = lut[q * 3]; g = lut[q * 3 + 1]; b = lut[q * 3 + 2];
+        } else {
+          var ga = (A[i] - 0.09) / 0.9; ga = ga <= 0 ? 0 : ga >= 1 ? 0.92 : 0.92 * Math.pow(ga, 0.6);
+          r += (86 - r) * ga; g += (150 - g) * ga; b += (52 - b) * ga;
+          var ta = (P[i] - 12) / 60; ta = ta <= 0 ? 0 : ta >= 1 ? 0.8 : 0.8 * ta;
+          r += (158 - r) * ta; g += (132 - g) * ta; b += (92 - b) * ta;
+        }
+      }
+      waterPx[o] = r; waterPx[o + 1] = g; waterPx[o + 2] = b; waterPx[o + 3] = 255;
+    }
+    waterCtx.putImageData(waterImg, 0, 0);
+    ctx.imageSmoothingEnabled = true; ctx.imageSmoothingQuality = 'high';
+    ctx.drawImage(waterCanvas, 0, 0, cw, ch);
+
+    // Ripples: wavelets lie across the wind and drift downwind; stronger wind
+    // makes them brighter and longer. Skipped where the water has dried up.
+    var wthr = S.weather, wcos = Math.cos(wthr.windDir), wsin = Math.sin(wthr.windDir);
+    var wStrength = Math.min(1.6, 0.35 + wthr.wind / 4);
+    ctx.lineWidth = Math.max(1, s * 0.14); ctx.lineCap = 'round';
+    for (k = 0; !lut && k < ripples.length; k++) {
+      var rp = ripples[k];
+      var drift = ((realSeconds * 0.35 * wStrength + rp.ph) % 3) - 1.5;
+      var gx = rp.x + 0.5 + wcos * drift, gy = rp.y + 0.5 + wsin * drift;
+      if (!S.wet[Math.round(gy) * W + Math.round(gx)]) continue;
+      var a = (0.07 + 0.08 * Math.sin(realSeconds * 0.9 + rp.ph * 3)) * wStrength * (1 - Math.abs(drift) / 1.6);
+      if (a <= 0.01) continue;
+      var half = rp.len * s * 0.5 * (0.7 + 0.3 * wStrength), cx = gx * s, cy = gy * s;
+      ctx.strokeStyle = 'rgba(255,255,255,' + a.toFixed(3) + ')';
+      ctx.beginPath(); ctx.moveTo(cx - wsin * half, cy + wcos * half);
+      ctx.quadraticCurveTo(cx + wcos * s * 0.45, cy + wsin * s * 0.45, cx + wsin * half, cy - wcos * half); ctx.stroke();
+    }
+
+    drawFish(tNow - Math.floor(tNow), realSeconds, s);
+    drawMarks(realSeconds, s);
+    if (layer === 'flow' && !replay) drawFlow(s);
+
+    ctx.drawImage(landCanvas, 0, 0, cw, ch);
+
+    // Day and night: a warm wash near sunrise and sunset, a deep blue one at night.
+    var sn = B.sun(tNow);
+    drawClouds(realSeconds, s, sn);
+    var golden = Math.max(0, 1 - Math.abs(sn.elev - 0.1) / 0.22);
+    if (golden > 0.01) { ctx.fillStyle = 'rgba(255,150,60,' + (0.2 * golden).toFixed(3) + ')'; ctx.fillRect(0, 0, cw, ch); }
+    if (sn.light < 0.99) { ctx.fillStyle = 'rgba(10,18,54,' + (0.62 * (1 - sn.light)).toFixed(3) + ')'; ctx.fillRect(0, 0, cw, ch); }
+    drawSky(realSeconds, s, sn);
+    return sn;
+  }
+
+  // ---------- D. Main loop ------------------------------------------------
+  // Rendering runs every animation frame. The simulation advances in fixed
+  // 6-sim-minute steps, however fast or slow the frames arrive.
+  var frameAvg = 16, hudTimer = 0;
+  var workRing = new Float32Array(120), workN = 0;     // CPU time spent per frame (sim + draw), for the self-test
+  function frame(ts) {
+    var w0 = performance.now();
+    var dt = Math.min(0.1, Math.max(0, (ts - lastTs) / 1000)); lastTs = ts;
+    frameAvg += (dt * 1000 - frameAvg) * 0.05;
+    var k, steps, preparing = scn && scn.st.phase === 'prep';
+    if (replay) {
+      if (replay.playing) {                                  // auto-play: about 10 snapshots (30 sim-hours) per second
+        replay.kf += dt * 10;
+        var n = B.snapshotCount(sim), kk = Math.min(n - 1, Math.floor(replay.kf));
+        if (kk !== replay.k) setReplayK(kk);
+        if (kk >= n - 1) setReplayPlaying(false);
+      }
+    } else {
+      acc += dt * RATE[speed];
+      steps = preparing ? 60 : Math.min(MAX_STEPS_PER_FRAME, acc | 0);   // 'setting the scene' runs ahead quickly
+      for (k = 0; k < steps; k++) {
+        if (scn) { B.scenarioStep(sim, scn.st); if (scn.st.done) { endScenario(false); break; } }
+        else B.step(sim);
+      }
+      if (!preparing) { acc -= steps; if (acc > 1) acc = 1; }        // drop any backlog instead of spiralling
+      else acc = 0;
+    }
+    S = replay ? view : sim;
+    var sn = render(S.t + (speed && !replay && !preparing ? Math.min(acc, 1) : 0), ts / 1000);
+    if (scn) setText('caption', scn.st.caption);
+    hudTimer += dt; exTimer += dt;
+    if (hudTimer > 0.1) { hudTimer = 0; updateHud(sn); }
+    if (exTimer > 0.4) { exTimer = 0; updateHealth(); if (!replay) updateExplain(false); }
+    workRing[workN++ % 120] = performance.now() - w0;
+    requestAnimationFrame(frame);
+  }
+
+  // ---------- E. Controls and readouts ------------------------------------
+  var hudCache = {};
+  var COMPASS = ['E', 'SE', 'S', 'SW', 'W', 'NW', 'N', 'NE'];   // screen y points south
+  function compass(a) { return COMPASS[((Math.round(a / (Math.PI / 4)) % 8) + 8) % 8]; }
+  function setText(id, text) { if (hudCache[id] !== text) { hudCache[id] = text; el(id).textContent = text; } }
+  function updateHud(sn) {
+    var c = B.clock(S.t);
+    setText('clock', c.time); setText('date', c.date);
+    var bud = sim.ev.budget;
+    setText('budgetChip', '💰 ' + bud + ' credits'); setText('fixCredits', String(bud)); el('budgetFill').style.width = bud + '%';
+    var st = sim.stats, w = sim.weather;
+    setText('statO', st.meanO.toFixed(1) + ' · ' + st.minO.toFixed(1) + ' mg/L');
+    setText('statChl', Math.round(st.meanChl) + ' µg/L');
+    setText('statT', st.meanT.toFixed(1) + ' °C');
+    setText('statFish', sim.fish.alive + (sim.fish.deaths ? ' (' + sim.fish.deaths + ' died)' : ''));
+    setText('statWind', w.wind.toFixed(1) + ' m/s from ' + compass(w.windDir + Math.PI));
+    setText('statLevel', (sim.level >= 0 ? '+' : '') + sim.level.toFixed(2) + ' m · ' + Math.round(100 * sim.wetCount / sim.fullWetCount) + '%');
+    setText('statSun', sn.light < 0.05 ? 'Night' : Math.round(sn.light * 100) + '%');
+    setText('statFrame', frameAvg.toFixed(1) + ' ms');
+  }
+
+  // ----- Health score, timeline, diary -----
+  function scoreColor(v) { return v >= 80 ? '#6fd08c' : v >= 60 ? '#f2b84b' : v >= 40 ? '#ec835a' : '#e8574f'; }
+  function scoreWord(v) { return v >= 80 ? 'Healthy' : v >= 60 ? 'Fair' : v >= 40 ? 'Stressed' : 'Crisis'; }
+  function sizeChart(c) {
+    var dpr = Math.min(2, window.devicePixelRatio || 1), w = Math.max(60, c.clientWidth), h = c.clientHeight;
+    if (c.width !== Math.round(w * dpr) || c.height !== Math.round(h * dpr)) { c.width = Math.round(w * dpr); c.height = Math.round(h * dpr); }
+    var g = c.getContext('2d'); g.setTransform(dpr, 0, 0, dpr, 0, 0); g.clearRect(0, 0, w, h);
+    return { g: g, w: w, h: h };
+  }
+  // Markers for events and interventions (not consequences) inside a time window.
+  function drawMarkers(g, w, h, t0, t1, top) {
+    var log = sim.ev.log; g.save();
+    g.strokeStyle = 'rgba(234,243,244,0.38)'; g.fillStyle = 'rgba(234,243,244,0.8)'; g.lineWidth = 1; g.setLineDash([3, 3]);
+    for (var k = 0; k < log.length; k++) {
+      var e = log[k]; if (e.kind === 'effect' || e.t < t0 || e.t > t1) continue;
+      var x = (e.t - t0) / (t1 - t0) * w;
+      g.beginPath(); g.moveTo(x, top + 5); g.lineTo(x, h); g.stroke();
+      g.setLineDash([]); g.beginPath(); g.moveTo(x - 4, top); g.lineTo(x + 4, top); g.lineTo(x, top + 6); g.fill(); g.setLineDash([3, 3]);
+    }
+    g.restore();
+  }
+  function drawScoreChart() {
+    var c = el('scoreChart'), q = sizeChart(c), g = q.g, w = q.w, h = q.h, ev = sim.ev;
+    var span = 10 * B.STEPS_PER_DAY, t1 = Math.max(sim.t, span / 2), t0 = t1 - span, padB = 14, ph = h - padB - 8;
+    function X(t) { return (t - t0) / span * w; } function Y(v) { return 8 + ph * (1 - v / 100); }
+    g.fillStyle = 'rgba(232,87,79,0.10)'; g.fillRect(0, Y(40), w, Y(0) - Y(40));
+    g.fillStyle = 'rgba(242,184,75,0.08)'; g.fillRect(0, Y(80), w, Y(40) - Y(80));
+    g.strokeStyle = 'rgba(157,183,192,0.25)'; g.lineWidth = 1; g.beginPath();
+    [40, 80].forEach(function (v) { g.moveTo(0, Y(v)); g.lineTo(w, Y(v)); }); g.stroke();
+    g.fillStyle = '#9db7c0'; g.font = '11px system-ui, sans-serif'; g.textBaseline = 'middle';
+    g.fillText('80', 2, Y(80) - 6); g.fillText('40', 2, Y(40) - 6);
+    drawMarkers(g, w, h - padB, t0, t1, 0);
+    if (replay) { g.save(); g.strokeStyle = '#f2b84b'; g.lineWidth = 2; g.beginPath(); g.moveTo(X(S.t), 0); g.lineTo(X(S.t), h - padB); g.stroke(); g.restore(); }
+    var T = ev.scoreT, V = ev.scoreV, n = T.length;
+    if (n > 1) {
+      g.strokeStyle = scoreColor(V[n - 1]); g.lineWidth = 2.5; g.lineJoin = 'round'; g.beginPath(); var started = false;
+      for (var k = 0; k < n; k++) { if (T[k] < t0) continue; if (!started) { g.moveTo(X(T[k]), Y(V[k])); started = true; } else g.lineTo(X(T[k]), Y(V[k])); }
+      g.stroke();
+      g.fillStyle = scoreColor(V[n - 1]); g.beginPath(); g.arc(X(T[n - 1]), Y(V[n - 1]), 4, 0, 6.2832); g.fill();
+    }
+    g.fillStyle = '#9db7c0'; g.textBaseline = 'alphabetic'; g.textAlign = 'right'; g.fillText('now', w - 2, h - 2); g.textAlign = 'left'; g.fillText('10 days ago', 2, h - 2);
+  }
+  var lastLogId = -1;
+  function updateHealth() {
+    var v = Math.round(S.scoreSmooth), col = scoreColor(v), p = S.scoreParts;
+    setText('healthNum', String(v)); el('healthNum').style.color = col;
+    setText('healthLabel', scoreWord(v)); el('healthLabel').style.color = col;
+    setText('healthParts', 'Oxygen ' + Math.round(p.oxygen) + '/30 · Algae ' + Math.round(p.algae) + '/25 · Fish ' + Math.round(p.fish) + '/25 · Clarity ' + Math.round(p.clarity) + '/10 · Level ' + Math.round(p.level) + '/10');
+    drawScoreChart();
+    var log = sim.ev.log, top = log.length ? log[log.length - 1].id : 0;
+    if (top !== lastLogId) { lastLogId = top; renderDiary(); }
+  }
+  function renderDiary() {
+    var ul = el('diary'), log = sim.ev.log; ul.textContent = '';
+    if (!log.length) { var li0 = document.createElement('li'); li0.textContent = 'Nothing has happened yet.'; ul.appendChild(li0); return; }
+    for (var k = log.length - 1; k >= 0 && k >= log.length - 40; k--) {
+      var e = log[k], li = document.createElement('li'), b = document.createElement('b'), sm = document.createElement('small');
+      li.className = e.kind; b.textContent = e.label; sm.textContent = B.clock(e.t).date.replace(/ · .*/, '') + ' ' + B.clock(e.t).time + ' · score ' + e.score;
+      var cs = e.causes.map(function (id) { var c = B.findEntry(sim, id); return c ? c.label : null; }).filter(Boolean);
+      if (cs.length) sm.textContent += ' · because: ' + cs.join(' + ');
+      li.appendChild(b); li.appendChild(sm); ul.appendChild(li);
+    }
+  }
+
+  // ----- Explain panel -----
+  var exKey = '', exTimer = 0;
+  function currentCell() {
+    if (!selection) return -1;
+    if (selection.kind === 'cell') return selection.i;
+    var f = sim.fish; return Math.max(0, Math.min(H - 1, f.y[selection.k] | 0)) * W + Math.max(0, Math.min(W - 1, f.x[selection.k] | 0));
+  }
+  function updateExplain(force) {
+    if (!selection) return;
+    var ex = selection.kind === 'fish' ? B.explainFish(sim, selection.k) : B.explainCell(sim, selection.i);
+    var key = ex.title + '|' + ex.lines.join('|') + '|' + ex.chain.map(function (e) { return e.id; }).join(',');
+    if (key !== exKey || force) {
+      exKey = key; setText('exTitle', ex.title);
+      var box = el('exLines'); box.textContent = '';
+      ex.lines.forEach(function (l) { var p = document.createElement('p'); p.textContent = l; box.appendChild(p); });
+      var ul = el('exChain'); ul.textContent = '';
+      ex.chain.forEach(function (e) {
+        var li = document.createElement('li'); li.className = e.kind; li.textContent = e.label;
+        var sm = document.createElement('small'); sm.textContent = B.ago(sim, e.t); li.appendChild(sm); ul.appendChild(li);
+      });
+    }
+    drawGraphs();
+  }
+  function drawSpark(id, valId, series, t0, t1, color, lo, hi, fmtv, guide) {
+    var c = el(id), q = sizeChart(c), g = q.g, w = q.w, h = q.h, T = series.t, V = series.v, n = T.length, k;
+    var last = NaN; for (k = n - 1; k >= 0; k--) if (isFinite(V[k])) { last = V[k]; break; }
+    setText(valId, isFinite(last) ? fmtv(last) : '–');
+    if (hi <= lo) hi = lo + 1;
+    function X(t) { return (t - t0) / (t1 - t0) * w; } function Y(v) { return 4 + (h - 8) * (1 - (v - lo) / (hi - lo)); }
+    g.strokeStyle = 'rgba(157,183,192,0.18)'; g.lineWidth = 1; g.beginPath(); g.moveTo(0, h - 0.5); g.lineTo(w, h - 0.5); g.stroke();
+    if (guide !== undefined && guide > lo && guide < hi) {
+      g.save(); g.setLineDash([2, 3]); g.strokeStyle = 'rgba(232,87,79,0.55)'; g.beginPath(); g.moveTo(0, Y(guide)); g.lineTo(w, Y(guide)); g.stroke(); g.restore();
+    }
+    drawMarkers(g, w, h, t0, t1, 0);
+    g.strokeStyle = color; g.lineWidth = 2; g.lineJoin = 'round'; g.beginPath(); var on = false;
+    for (k = 0; k < n; k++) { if (!isFinite(V[k])) { on = false; continue; } if (!on) { g.moveTo(X(T[k]), Y(V[k])); on = true; } else g.lineTo(X(T[k]), Y(V[k])); }
+    g.stroke();
+    if (isFinite(last)) { g.fillStyle = color; g.strokeStyle = '#1c3644'; g.lineWidth = 2; g.beginPath(); g.arc(X(T[n - 1]), Y(last), 3.5, 0, 6.2832); g.stroke(); g.fill(); }
+  }
+  function drawGraphs() {
+    var i = currentCell(); el('graphs').hidden = !(i >= 0 && sim.wet[i]);
+    if (i < 0 || !sim.wet[i]) return;
+    var h = B.cellHistory(sim, i), t1 = sim.t, t0 = t1 - 5 * B.STEPS_PER_DAY, mx, k;
+    mx = 60; for (k = 0; k < h.chl.length; k++) mx = Math.max(mx, h.chl[k]);
+    drawSpark('gO', 'gvO', { t: h.t, v: h.O }, t0, t1, '#7dc4f0', 0, 12, function (v) { return v.toFixed(1) + ' mg/L'; }, 3);
+    drawSpark('gA', 'gvA', { t: h.t, v: h.chl }, t0, t1, '#8fdc8a', 0, mx * 1.1, function (v) { return Math.round(v) + ' µg/L'; });
+    var tl = 1e9, th = -1e9; for (k = 0; k < h.T.length; k++) if (isFinite(h.T[k])) { tl = Math.min(tl, h.T[k]); th = Math.max(th, h.T[k]); }
+    drawSpark('gT', 'gvT', { t: h.t, v: h.T }, t0, t1, '#f5a35c', Math.min(24, tl - 0.5), Math.max(32, th + 0.5), function (v) { return v.toFixed(1) + ' °C'; });
+    var fm = 6; for (k = 0; k < h.fish.length; k++) fm = Math.max(fm, h.fish[k]);
+    drawSpark('gF', 'gvF', { t: h.t, v: h.fish }, t0, t1, '#ece6d2', 0, fm * 1.1, function (v) { return Math.round(v) + ' fish'; });
+  }
+
+  // On wide screens the side panel scrolls on its own: bring the Explain card into view after a tap.
+  function revealExplain() {
+    if (window.innerWidth <= 900) return;
+    var card = el('exTitle').closest('section'), aside = card.parentNode, ar = aside.getBoundingClientRect(), cr = card.getBoundingClientRect();
+    if (cr.top < ar.top || cr.top > ar.top + ar.height * 0.55) aside.scrollTo({ top: aside.scrollTop + cr.top - ar.top - 10, behavior: 'smooth' });
+  }
+
+  // ----- Events, Fix It tools and messages -----
+  // Messages appear on the line above the caption so they are always next to the map.
+  function say(msg) { setText('toast', msg); setText('evMsg', msg); setText('fixMsg', msg); clearTimeout(say.t); say.t = setTimeout(function () { setText('toast', ''); setText('evMsg', ''); setText('fixMsg', ''); }, 7000); }
+  var HINTS = { sewage: 'Tap the shore where the pipe should open. Esc cancels.', aerator: 'Tap the water to place an aerator (8 credits). Esc to stop.',
+                plant: 'Tap a sewage pipe to build a treatment plant (40 credits). Esc cancels.', wetland: 'Tap the shore to plant a wetland buffer (15 credits). Esc to stop.' };
+  function setArmed(kind) {
+    armed = kind; canvas.style.cursor = kind ? 'copy' : 'crosshair';
+    document.querySelectorAll('[data-fix],[data-ev="sewage"]').forEach(function (b) { b.setAttribute('aria-pressed', String((b.dataset.fix || 'sewage') === kind)); });
+    if (kind) say(HINTS[kind]);
+  }
+  function viewOnly() { if (replay) { say('Rewind is view-only. Return to live, or resume from here, to change the lake.'); return true; } return false; }
+  function fireEvent(type) {
+    if (viewOnly()) return;
+    if (type === 'sewage') { setArmed(armed === 'sewage' ? null : 'sewage'); return; }
+    setArmed(null);
+    var r = B.triggerEvent(sim, type); say(r.ok ? r.msg + ' started.' : r.msg);
+    if (r.ok) { hudTimer = 1; }
+  }
+  function fixTool(type) {
+    if (viewOnly()) return;
+    if (type === 'ban' || type === 'crew') {
+      setArmed(null);
+      var r = B.buildAction(sim, type); say(r.ok ? r.msg + ' · ' + sim.ev.budget + ' credits left.' : r.msg); hudTimer = 1; return;
+    }
+    setArmed(armed === type ? null : type);
+  }
+
+  // ----- Map layers and legends -----
+  function setLayer(l) {
+    layer = l;
+    document.querySelectorAll('[data-layer]').forEach(function (b) { b.setAttribute('aria-pressed', String(b.dataset.layer === l)); });
+    var box = el('legend'); box.textContent = '';
+    function span(cls, text) { var x = document.createElement('span'); if (cls) x.className = cls; x.textContent = text; return x; }
+    if (PALETTES[l]) {
+      var pal = PALETTES[l], wrapDiv = document.createElement('div'), bar = document.createElement('div'), ticks = document.createElement('div'); wrapDiv.className = 'bw';
+      bar.className = 'bar'; bar.style.background = 'linear-gradient(to right,' + pal.stops.map(function (st) { return st[1] + ' ' + Math.round(st[0] * 100) + '%'; }).join(',') + ')';
+      ticks.className = 'ticks';
+      pal.ticks.forEach(function (tv) { var t = span('', tv === pal.max ? tv + '+' : String(tv)); t.style.left = (tv / pal.max * 100) + '%'; ticks.appendChild(t); });
+      wrapDiv.appendChild(bar); wrapDiv.appendChild(ticks);
+      box.appendChild(span('lt', pal.title)); box.appendChild(wrapDiv); box.appendChild(span('', pal.note));
+    } else if (l === 'flow') {
+      box.appendChild(span('lt', 'Currents')); box.appendChild(span('', 'Arrows show where the water is moving. Longer arrow = faster. Wind pushes the surface; the river flows west to east.'));
+    } else {
+      [['#2f7fb5', 'clear, healthy water'], ['#6aa03a', 'algae (green)'], ['#9a8458', 'murky (brown)'], ['#f2f7fa', 'fish, aerators, pipes on top']].forEach(function (c) {
+        var w = document.createElement('span'); var sw = span('sw', ''); sw.style.background = c[0]; w.appendChild(sw); w.appendChild(document.createTextNode(c[1])); box.appendChild(w);
+      });
+    }
+  }
+
+  // ----- Rewind: view-only playback of the last 8 sim-days -----
+  function replayLabel() {
+    var sn = B.snapshotAt(sim, replay.k), c = B.clock(sn.t);
+    setText('scrubLabel', c.date.replace(/ · .*/, '') + ' ' + c.time + ' · score ' + Math.round(sn.scoreSmooth));
+  }
+  function setReplayK(k) {
+    var n = B.snapshotCount(sim); k = Math.max(0, Math.min(n - 1, k));
+    replay.k = k; view = B.snapshotView(sim, B.snapshotAt(sim, k)); el('scrubRange').value = k; replayLabel(); S = view;
+  }
+  function setReplayPlaying(on) {
+    replay.playing = on; el('scrubPlay').setAttribute('aria-pressed', String(on)); el('scrubPlay').textContent = on ? '❚❚ Pause' : '▶ Play';
+    if (on) { if (replay.k >= B.snapshotCount(sim) - 1) setReplayK(0); replay.kf = replay.k; }
+  }
+  function enterReplay() {
+    if (replay) { exitReplay(false); return; }
+    var n = B.snapshotCount(sim);
+    if (n < 2) { say('Not enough history yet. Let the lake run for a few sim-hours first.'); return; }
+    setArmed(null);
+    replay = { k: n - 1, kf: n - 1, playing: false };
+    el('scrubRange').max = n - 1; el('scrub').hidden = false; el('legend').hidden = true; el('rewindBtn').setAttribute('aria-pressed', 'true');
+    setReplayK(n - 1); setReplayPlaying(false);
+    say('Rewind: drag the slider or press Play to watch how the lake got here. View only.');
+    fitCanvas();
+  }
+  function exitReplay(resume) {
+    if (!replay) return;
+    var label = el('scrubLabel').textContent;
+    if (resume) { B.restoreSnapshot(sim, replay.k); endScenario(true); selection = null; exKey = ''; landDirty = true; lastLogId = -1; acc = 0; }
+    replay = null; view = null; S = sim;
+    el('scrub').hidden = true; el('legend').hidden = false; el('rewindBtn').setAttribute('aria-pressed', 'false');
+    say(resume ? 'Resumed from ' + label + '. Later history was discarded.' : 'Back to the live lake.');
+    updateHealth(); fitCanvas();
+  }
+
+  // ----- Scenarios -----
+  function startScenario(key) {
+    if (replay) exitReplay(false);
+    restart();
+    scn = { st: B.scenarioCreate(sim, key), key: key };
+    document.querySelectorAll('[data-scn]').forEach(function (b) { b.setAttribute('aria-pressed', String(b.dataset.scn === key)); });
+    setText('caption', scn.st.caption); setSpeed(100);
+  }
+  function endScenario(silent) {
+    if (!scn) return;
+    var cap = scn.st.caption, done = scn.st.done; scn = null;
+    document.querySelectorAll('[data-scn]').forEach(function (b) { b.setAttribute('aria-pressed', 'false'); });
+    if (!silent) { setText('caption', done ? cap + '  ·  Scenario complete: tap the lake or run another story.' : cap); setSpeed(10); }
+  }
+
+  // ----- Self-test -----
+  // Runs on separate copies of the simulation, so the lake on screen is untouched.
+  // 1. nutrient ledger balances (5 sim-days with rain, sewage, immersion, heat, drought and fixes)
+  // 2. nothing goes negative  3. fish counts never negative  4. no NaN or Infinity
+  // 5. same seed gives identical results twice  6. awkward inputs do not crash
+  // 7. frame time under 16.7 ms, measured on the live app over 120 frames
+  var testRunning = false;
+  async function selfTest() {
+    if (testRunning) return;
+    testRunning = true;
+    var dlg = el('testDlg'), list = el('testList'), sum = el('testSummary'), runBtn = el('testRun');
+    if (!dlg.open) dlg.showModal();
+    list.textContent = ''; sum.textContent = 'Running…'; sum.style.color = ''; runBtn.disabled = true;
+    var passed = 0, total = 0;
+    function row(name) {
+      var li = document.createElement('li'), m = document.createElement('span'), b = document.createElement('span'), sm = document.createElement('small');
+      li.className = 'run'; m.className = 'mark'; m.textContent = '…'; b.textContent = name; li.appendChild(m); li.appendChild(b); li.appendChild(sm); list.appendChild(li);
+      return { li: li, m: m, sm: sm };
+    }
+    function done(r, ok, detail) { r.li.className = ok ? 'pass' : 'fail'; r.m.textContent = ok ? '✓' : '✗'; r.sm.textContent = detail || ''; total++; if (ok) passed++; }
+    function tick() { return new Promise(function (res) { setTimeout(res, 0); }); }
+    var rLedger = row('Nutrients are conserved: ledger balances within 1% over 5 sim-days with events'),
+        rNeg = row('Oxygen and every other field never go negative'),
+        rFish = row('Fish counts never go negative (including a lake where every fish dies)'),
+        rNaN = row('No NaN or Infinity anywhere'),
+        rSeed = row('Same seed gives identical results twice'),
+        rEdge = row('Awkward inputs do not crash (land taps, zero budget, dry lake, no fish, rewind)'),
+        rFrame = row('Frame time under 16.7 ms over 120 frames');
+    try {
+      var seed = sim.seed, acc2 = { bad: 0, min: 0, minFish: 1e9, maxLedger: 0, maxFishAlive: 0 };
+      var scan = function (T) {
+        var k, i, f, v, fi = T.fish;
+        for (k = 0; k < T.wetCount; k++) {
+          i = T.wetList[k];
+          for (f = 0; f < B.FIELDS.length; f++) { v = T[B.FIELDS[f]][i]; if (!isFinite(v)) acc2.bad++; else if (v < acc2.min) acc2.min = v; }
+          v = T.sed[i]; if (!isFinite(v)) acc2.bad++; else if (v < acc2.min) acc2.min = v;
+        }
+        for (k = 0; k < B.FISH_MAX; k++) if (fi.state[k] && !(isFinite(fi.x[k]) && isFinite(fi.y[k]) && isFinite(fi.stress[k]))) acc2.bad++;
+        var sc = [T.score, T.scoreSmooth, T.level, T.stats.meanO, T.stats.meanChl, T.stats.meanT];
+        for (k = 0; k < sc.length; k++) if (!isFinite(sc[k])) acc2.bad++;
+        acc2.minFish = Math.min(acc2.minFish, fi.alive, fi.deaths); acc2.maxFishAlive = Math.max(acc2.maxFishAlive, fi.alive);
+        var le = Math.abs(B.ledgerError(T)); if (le > acc2.maxLedger) acc2.maxLedger = le;
+      };
+      var script = function (T) {                                  // the same events every time, on exact steps
+        var g = T.world.ghat, at = {};
+        at[40] = function () { B.triggerEvent(T, 'sewage', g.x + 8.5, g.y + 1.5); };
+        at[80] = function () { B.triggerEvent(T, 'rain'); };
+        at[200] = function () { B.triggerEvent(T, 'heat'); };
+        at[300] = function () { B.triggerEvent(T, 'immersion'); };
+        at[480] = function () { var b = -1, a = -1; for (var k = 0; k < T.wetCount; k++) { var i = T.wetList[k]; if (T.depth[i] > 1 && T.A[i] > a) { a = T.A[i]; b = i; } } if (b >= 0) B.buildAction(T, 'aerator', b % W + 0.5, ((b / W) | 0) + 0.5); };
+        at[560] = function () { if (T.ev.pipes[0]) B.buildAction(T, 'plant', T.ev.pipes[0].x, T.ev.pipes[0].y); };
+        at[640] = function () { B.buildAction(T, 'wetland', g.x - 10, g.y); };
+        at[700] = function () { B.triggerEvent(T, 'drought'); };
+        at[900] = function () { B.buildAction(T, 'ban'); B.buildAction(T, 'crew'); };
+        return at;
+      };
+      var advance = async function (T, n, at, doScan) {
+        for (var i = 0; i < n; i++) {
+          if (at && at[T.t]) at[T.t]();
+          B.step(T);
+          if (doScan && T.t % 20 === 0) scan(T);
+          if (i % 100 === 99) await tick();
+        }
+        if (doScan) scan(T);
+      };
+      // 1-4: five sim-days of events on a fresh copy
+      var A = B.createSim(seed, { noSnaps: true });
+      await advance(A, 5 * B.STEPS_PER_DAY, script(A), true);
+      done(rLedger, acc2.maxLedger < 0.01, 'worst imbalance ' + (acc2.maxLedger * 100).toFixed(4) + '% (limit 1%)');
+      done(rNeg, acc2.min >= 0, 'lowest value seen ' + acc2.min.toFixed(4));
+      // every fish dying: force zero oxygen for two days
+      var D = B.createSim(seed + 7, { noSnaps: true });
+      for (var q = 0; q < 2 * B.STEPS_PER_DAY; q++) { D.O.fill(0); B.step(D); if (q % 100 === 99) { scan(D); await tick(); } }
+      scan(D);
+      done(rFish, acc2.minFish >= 0 && acc2.maxFishAlive <= B.FISH_MAX && D.fish.alive >= 0, 'fewest fish ' + acc2.minFish + '; the forced fish kill left ' + D.fish.alive + ' alive and ' + D.fish.deaths + ' dead');
+      done(rNaN, acc2.bad === 0, acc2.bad + ' bad values found across fields, fish and scores');
+      // 5: determinism
+      var X = B.createSim(seed, { noSnaps: true }), Y = B.createSim(seed, { noSnaps: true }), sx = script(X), sy = script(Y), same = true;
+      for (var n = 0; n < 2 * B.STEPS_PER_DAY; n++) {
+        if (sx[X.t]) sx[X.t](); if (sy[Y.t]) sy[Y.t](); B.step(X); B.step(Y);
+        if (n % 100 === 99) await tick();
+      }
+      same = X.rngState === Y.rngState && X.t === Y.t && X.fish.deaths === Y.fish.deaths;
+      for (var c = 0; c < N && same; c++) if (X.O[c] !== Y.O[c] || X.A[c] !== Y.A[c] || X.N[c] !== Y.N[c] || X.T[c] !== Y.T[c]) same = false;
+      for (var f2 = 0; f2 < B.FISH_MAX && same; f2++) if (X.fish.x[f2] !== Y.fish.x[f2] || X.fish.y[f2] !== Y.fish.y[f2] || X.fish.state[f2] !== Y.fish.state[f2]) same = false;
+      done(rSeed, same, 'seed ' + seed + ': two runs of 2 sim-days, all fields, every fish and the random stream match');
+      // 6: edge cases
+      var errs = [], E = B.createSim(seed + 3), calls = 0;
+      var guard = function (name, fn) { try { fn(); calls++; } catch (e) { errs.push(name + ': ' + e.message); } };
+      var g0 = E.world.ghat;
+      guard('pipe on land', function () { B.triggerEvent(E, 'sewage', 2, 2); });
+      guard('events in a row', function () { for (var k = 0; k < 30; k++) ['rain', 'heat', 'drought', 'immersion', 'sewage', 'nonsense'].forEach(function (t) { B.triggerEvent(E, t, g0.x + k % 5, g0.y); }); });
+      guard('steps after events', function () { for (var k = 0; k < 60; k++) B.step(E); });
+      guard('tools on land and water', function () { ['aerator', 'plant', 'wetland', 'ban', 'crew'].forEach(function (t) { B.buildAction(E, t, 2, 2); B.buildAction(E, t, 80, 50); }); });
+      guard('zero budget', function () { E.ev.budget = 0; ['aerator', 'plant', 'wetland', 'ban', 'crew'].forEach(function (t) { if (B.buildAction(E, t, 80, 50).ok) throw new Error(t + ' worked with no credits'); }); });
+      guard('explain land and edges', function () { B.explainCell(E, 0); B.explainCell(E, N - 1); B.explainCell(E, E.wetList[0]); });
+      guard('snapshots', function () { for (var k = 0; k < 90; k++) B.step(E); if (B.snapshotCount(E) < 2 || !B.restoreSnapshot(E, 1)) throw new Error('restore failed'); B.step(E); });
+      guard('every fish dead', function () { for (var k = 0; k < B.FISH_MAX; k++) if (E.fish.state[k] === 1) E.fish.stress[k] = 2; for (var k2 = 0; k2 < 5; k2++) B.step(E); if (E.fish.alive !== 0) throw new Error('fish still alive'); B.explainFish(E, 0); B.explainCell(E, E.wetList[5]); for (var k3 = 0; k3 < 120; k3++) B.step(E); });
+      guard('lake nearly dry', function () { B.setLevel(E, -6.4); for (var k = 0; k < 120; k++) B.step(E); B.triggerEvent(E, 'sewage', 80, 50); B.setLevel(E, 0.6); for (var k2 = 0; k2 < 60; k2++) B.step(E); });
+      guard('values still finite', function () { scan(E); if (acc2.bad) throw new Error('bad values after edge cases'); });
+      await tick();
+      done(rEdge, errs.length === 0, errs.length ? errs.join('; ') : calls + ' awkward cases handled');
+      // 7: frame time on the live app
+      var start = workN, t0 = performance.now();
+      while (workN - start < 120 && performance.now() - t0 < 9000) await new Promise(function (res) { setTimeout(res, 40); });
+      if (workN - start < 120) done(rFrame, false, 'the page was not drawing frames (hidden tab?); only ' + (workN - start) + ' frames seen');
+      else {
+        var sumW = 0, worst = 0; for (var w = 0; w < 120; w++) { sumW += workRing[w]; if (workRing[w] > worst) worst = workRing[w]; }
+        done(rFrame, sumW / 120 < 16.7, 'average ' + (sumW / 120).toFixed(2) + ' ms of work per frame, worst ' + worst.toFixed(1) + ' ms (limit 16.7 ms average)');
+      }
+    } catch (e) {
+      sum.textContent = 'Self-test crashed: ' + e.message; sum.style.color = '#ff7b72'; runBtn.disabled = false; testRunning = false; return;
+    }
+    sum.textContent = passed + ' of ' + total + ' checks passed'; sum.style.color = passed === total ? 'var(--good)' : '#ff7b72';
+    runBtn.disabled = false; testRunning = false;
+  }
+
+  function setSpeed(v) {
+    speed = v;
+    var btns = document.querySelectorAll('[data-speed]');
+    for (var i = 0; i < btns.length; i++) btns[i].setAttribute('aria-pressed', String(+btns[i].dataset.speed === v));
+  }
+  var lastRunSpeed = 10;
+  function togglePause() { if (speed) { lastRunSpeed = speed; setSpeed(0); } else setSpeed(lastRunSpeed); }
+
+  function restart() {
+    var seed = parseInt(el('seed').value, 10);
+    if (!isFinite(seed) || seed < 0) seed = 1100;
+    seed = seed >>> 0; el('seed').value = seed;
+    sim = B.createSim(seed); world = sim.world; acc = 0;
+    landDirty = true; buildRipples(); buildSky();
+    setText('probe', 'Move over the map.');
+    selection = null; exKey = ''; lastLogId = -1; S = sim; view = null; scn = null; replay = null; setArmed(null);
+    el('scrub').hidden = true; el('legend').hidden = false; el('rewindBtn').setAttribute('aria-pressed', 'false');
+    document.querySelectorAll('[data-scn]').forEach(function (b) { b.setAttribute('aria-pressed', 'false'); });
+    setText('caption', ''); setText('toast', '');
+    hudCache.exTitle = 'Tap the lake'; el('exTitle').textContent = 'Tap the lake'; el('exLines').innerHTML = '<p>Tap any spot on the water, or a fish, to see why it is the way it is.</p>'; el('exChain').textContent = ''; el('graphs').hidden = true;
+    updateHud(B.sun(0)); updateHealth();
+  }
+
+  // Convert a pointer position to a grid cell (or null if outside the map).
+  function cellAt(ev) {
+    var r = canvas.getBoundingClientRect();
+    var x = Math.floor((ev.clientX - r.left) / r.width * W), y = Math.floor((ev.clientY - r.top) / r.height * H);
+    return (x < 0 || y < 0 || x >= W || y >= H) ? null : { x: x, y: y, i: y * W + x };
+  }
+  function probe(ev) {
+    var c = cellAt(ev); if (!c) return;
+    var i = c.i;
+    setText('probe', sim.wet[i]
+      ? 'Water ' + sim.depth[i].toFixed(1) + ' m deep · O₂ ' + sim.O[i].toFixed(1) + ' mg/L · algae ' +
+        Math.round(sim.A[i] * B.CHL) + ' µg/L · ' + sim.T[i].toFixed(1) + ' °C'
+      : 'Land');
+  }
+
+  document.querySelectorAll('[data-speed]').forEach(function (b) {
+    b.addEventListener('click', function () { setSpeed(+b.dataset.speed); });
+  });
+  el('restart').addEventListener('click', restart);
+  el('seed').addEventListener('keydown', function (e) { if (e.key === 'Enter') restart(); });
+  // A tap uses the armed tool (sewage pipe, aerator, plant, wetland), or selects a fish or a spot on the lake.
+  function mapTap(ev) {
+    var c = cellAt(ev); if (!c) return;
+    if (viewOnly()) return;
+    var r2 = canvas.getBoundingClientRect(), gx = (ev.clientX - r2.left) / r2.width * W, gy = (ev.clientY - r2.top) / r2.height * H;
+    if (armed === 'sewage') {
+      var r = B.triggerEvent(sim, 'sewage', c.x + 0.5, c.y + 0.5);
+      say(r.ok ? r.msg + '.' : r.msg);
+      if (r.ok) { setArmed(null); selection = { kind: 'cell', i: B.nearestWetCell(sim, Math.round(r.entry.y - 0.5) * W + Math.round(r.entry.x - 0.5), 4) }; exKey = ''; updateExplain(true); updateHealth(); revealExplain(); }
+      return;
+    }
+    if (armed) {
+      var tool = armed, rb = B.buildAction(sim, tool, gx, gy);
+      say(rb.ok ? rb.msg + ' · ' + sim.ev.budget + ' credits left.' : rb.msg);
+      if (rb.ok) { updateHealth(); hudTimer = 1; }
+      if (sim.ev.budget < B.COST[tool]) setArmed(null);
+      return;
+    }
+    var f = sim.fish, best = -1, bd = 1.5 * 1.5;                       // a fish only if the tap is within ~1.5 cells of it
+    for (var k = 0; k < f.state.length; k++) {
+      if (!f.state[k]) continue;
+      var d2 = (f.x[k] - gx) * (f.x[k] - gx) + (f.y[k] - gy) * (f.y[k] - gy);
+      if (d2 < bd) { bd = d2; best = k; }
+    }
+    selection = best >= 0 ? { kind: 'fish', k: best } : { kind: 'cell', i: c.i };
+    exKey = ''; updateExplain(true); revealExplain();
+  }
+  canvas.addEventListener('pointermove', probe);
+  canvas.addEventListener('pointerdown', probe);
+  canvas.addEventListener('click', mapTap);
+  document.querySelectorAll('[data-ev]').forEach(function (b) { b.addEventListener('click', function () { fireEvent(b.dataset.ev); }); });
+  document.querySelectorAll('[data-fix]').forEach(function (b) { b.addEventListener('click', function () { fixTool(b.dataset.fix); }); });
+  document.querySelectorAll('[data-layer]').forEach(function (b) { b.addEventListener('click', function () { setLayer(b.dataset.layer); }); });
+  document.querySelectorAll('[data-scn]').forEach(function (b) { b.addEventListener('click', function () { if (scn && scn.key === b.dataset.scn) { endScenario(false); } else startScenario(b.dataset.scn); }); });
+  el('rewindBtn').addEventListener('click', enterReplay);
+  el('selfTestBtn').addEventListener('click', selfTest);
+  el('testRun').addEventListener('click', selfTest);
+  el('testClose').addEventListener('click', function () { el('testDlg').close(); });
+  el('scrubLive').addEventListener('click', function () { exitReplay(false); });
+  el('scrubResume').addEventListener('click', function () { exitReplay(true); });
+  el('scrubPlay').addEventListener('click', function () { setReplayPlaying(!replay.playing); });
+  el('scrubRange').addEventListener('input', function () { setReplayPlaying(false); setReplayK(+this.value); });
+  window.addEventListener('keydown', function (e) {
+    if (e.target && e.target.tagName === 'INPUT') return;
+    if (el('testDlg').open) return;
+    if (e.key === 'Escape') setArmed(null);
+    else if (e.code === 'Space') { e.preventDefault(); togglePause(); }
+    else if (e.key === '1') setSpeed(1); else if (e.key === '2') setSpeed(10); else if (e.key === '3') setSpeed(100);
+  });
+  // Coming back to a hidden tab must not fast-forward the lake: restart the frame clock.
+  document.addEventListener('visibilitychange', function () { lastTs = performance.now(); acc = 0; });
+  window.addEventListener('resize', fitCanvas);
+  if (window.ResizeObserver) { var ro = new ResizeObserver(fitCanvas); ro.observe(wrap); ro.observe(strip); ro.observe(toolbar); }
+  window.addEventListener('resize', function () { updateHealth(); updateExplain(true); });
+
+  restart();
+  setLayer('normal');
+  fitCanvas();
+  window.__bhoj = { get sim() { return sim; }, get scn() { return scn; }, get replay() { return replay; }, setSpeed: setSpeed, selfTest: selfTest, fire: fireEvent, fix: fixTool, setLayer: setLayer, startScenario: startScenario, enterReplay: enterReplay, exitReplay: exitReplay, setReplayK: setReplayK, tap: mapTap, select: function (sel) { selection = sel; exKey = ''; updateExplain(true); } };   // handy for tests and the console
+  requestAnimationFrame(function (ts) { lastTs = ts; requestAnimationFrame(frame); });
+})();
+</script>
+</body>
+</html>
