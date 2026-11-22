@@ -2039,7 +2039,7 @@
   var clouds = [], stars = [], lastRS = 0;
   function buildSky() {
     var rng = B.mulberry32(sim.seed + 99), k; clouds = []; stars = [];
-    for (k = 0; k < 8; k++) clouds.push({ x: rng() * (W + 80) - 40, y: rng() * (H + 40) - 20, r: 15 + rng() * 17, a: 0.6 + rng() * 0.4, v: 0.7 + rng() * 0.6 });
+    for (k = 0; k < 10; k++) clouds.push({ x: rng() * (W + 80) - 40, y: rng() * (H + 40) - 20, r: 9 + rng() * 10, a: 0.65 + rng() * 0.35, v: 0.7 + rng() * 0.6 });
     for (k = 0; k < 150; k++) stars.push({ x: rng() * W, y: rng() * H, r: 0.35 + rng() * 0.7, ph: rng() * 6.28, sp: 0.6 + rng() * 1.6 });
   }
   // Soft cloud shadows drift across the lake with the wind; more cover = more of them, darker.
@@ -2053,10 +2053,10 @@
       if (c.x > W + 40) c.x -= W + 80; else if (c.x < -40) c.x += W + 80;
       if (c.y > H + 20) c.y -= H + 40; else if (c.y < -20) c.y += H + 40;
       if (k >= n) continue;
-      var alpha = (0.1 + 0.24 * cover) * c.a * day, r = c.r * s;
+      var alpha = (0.26 + 0.46 * cover) * c.a * day, r = c.r * s;
       ctx.save(); ctx.translate(c.x * s, c.y * s); ctx.scale(1.6, 1);
       var g = ctx.createRadialGradient(0, 0, 0, 0, 0, r);
-      g.addColorStop(0, 'rgba(10,26,42,' + alpha.toFixed(3) + ')'); g.addColorStop(1, 'rgba(10,26,42,0)');
+      g.addColorStop(0, 'rgba(10,26,42,' + alpha.toFixed(3) + ')'); g.addColorStop(0.55, 'rgba(10,26,42,' + (alpha * 0.6).toFixed(3) + ')'); g.addColorStop(1, 'rgba(10,26,42,0)');
       ctx.fillStyle = g; ctx.fillRect(-r, -r, 2 * r, 2 * r); ctx.restore();
     }
   }

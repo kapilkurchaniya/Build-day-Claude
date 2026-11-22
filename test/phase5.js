@@ -60,13 +60,14 @@ const sleep = ms => new Promise(r => setTimeout(r, ms));
       if ([360, 1920, 3840].includes(w)) await shot(`p5-size-${w}.png`);
     }
     await send('Emulation.setDeviceMetricsOverride', { width: 1440, height: 900, deviceScaleFactor: 1, mobile: false });
-    // ---------- tab hidden and restored (last, because the lifecycle emulation leaves Chrome throttled) ----------
+    // ---------- tab hidden and restored (modelled as a long stall) ----------
     await send('Emulation.setDeviceMetricsOverride', { width: 1440, height: 900, deviceScaleFactor: 1, mobile: false }); await sleep(400);
     await ev('__bhoj.setSpeed(100)'); await sleep(800);
     const tA = await ev('__bhoj.sim.t');
-    await send('Page.setWebLifecycleState', { state: 'frozen' }); await sleep(4000); await send('Page.setWebLifecycleState', { state: 'active' }); await sleep(600);
+    await ev('(() => { const t0 = performance.now(); while (performance.now() - t0 < 4000); })()');   // the page is stalled for 4 s, like a hidden tab: the next frame arrives 4 s late
+    await sleep(600);
     const tB = await ev('__bhoj.sim.t');
-    check('after a hidden tab is restored the lake has not fast-forwarded', tB - tA < 80, 'advanced ' + (tB - tA) + ' steps over a 4.6 s gap (40 steps/s is normal at 100x)');
+    check('after a 4 s stall (hidden tab restored) the lake has not fast-forwarded', tB - tA < 80, 'advanced ' + (tB - tA) + ' steps (40 steps/s is normal at 100x; an uncapped catch-up would be 160+)');
     await sleep(2500); const tC = await ev('__bhoj.sim.t');
     check('and it carries on running normally afterwards', tC - tB >= 10 && tC - tB < 160, 'advanced ' + (tC - tB) + ' steps in 2.5 s');
     check('no script errors anywhere', errors.length === 0, errors);
